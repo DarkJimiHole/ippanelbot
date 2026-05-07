@@ -1,0 +1,22 @@
+[Unit]
+Description=IPPanelBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ippanelbot
+Group=ippanelbot
+WorkingDirectory=/opt/ippanelbot
+EnvironmentFile=/etc/ippanelbot.env
+ExecStart=/usr/bin/python3 /opt/ippanelbot/bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/ippanelbot
+
+[Install]
+WantedBy=multi-user.target
