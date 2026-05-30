@@ -2882,7 +2882,11 @@ class BotApp:
                 ]
             }
             self.telegram.edit_message_text(
-                chat_id, message_id, "\n".join(lines), reply_markup=keyboard
+                chat_id,
+                message_id,
+                telegram_html("\n".join(lines)),
+                reply_markup=keyboard,
+                parse_mode="HTML",
             )
         except IppanelError as exc:
             self.telegram.edit_message_text(chat_id, message_id, f"面板请求失败：{exc}")
@@ -2972,7 +2976,11 @@ class BotApp:
                 ]
             }
             self.telegram.edit_message_text(
-                chat_id, message_id, "\n".join(lines), reply_markup=keyboard
+                chat_id,
+                message_id,
+                telegram_html("\n".join(lines)),
+                reply_markup=keyboard,
+                parse_mode="HTML",
             )
         except IppanelError as exc:
             self.telegram.edit_message_text(chat_id, message_id, f"面板请求失败：{exc}")
@@ -3082,7 +3090,11 @@ class BotApp:
                 ]
             }
             self.telegram.edit_message_text(
-                chat_id, message_id, "\n".join(lines), reply_markup=keyboard
+                chat_id,
+                message_id,
+                telegram_html("\n".join(lines)),
+                reply_markup=keyboard,
+                parse_mode="HTML",
             )
         except IppanelError as exc:
             self.telegram.edit_message_text(chat_id, message_id, f"面板请求失败：{exc}")
@@ -3913,4 +3925,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        raise SystemExit(130)
