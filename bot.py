@@ -629,14 +629,12 @@ def validate_hostname(hostname: str) -> str:
 AUTO_LINK_RE = re.compile(
     r"(?<![\w/])((?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,})(?![\w/])"
 )
-BOLD_OPEN_TOKEN = "__IPPANELBOT_BOLD_OPEN__"
-BOLD_CLOSE_TOKEN = "__IPPANELBOT_BOLD_CLOSE__"
 PURITY_LINK_TOKEN = "__IPPANELBOT_PURITY_LINK__"
 PURITY_LINK_URL = "https://www.iplark.com/ip"
 
 
 def tg_bold(text: str) -> str:
-    return f"{BOLD_OPEN_TOKEN}{text}{BOLD_CLOSE_TOKEN}"
+    return str(text)
 
 
 def purity_link_line() -> str:
@@ -644,13 +642,9 @@ def purity_link_line() -> str:
 
 
 def apply_html_tokens(text: str) -> str:
-    return (
-        text.replace(BOLD_OPEN_TOKEN, "<b>")
-        .replace(BOLD_CLOSE_TOKEN, "</b>")
-        .replace(
-            PURITY_LINK_TOKEN,
-            f'<a href="{PURITY_LINK_URL}">查看纯净度</a>',
-        )
+    return text.replace(
+        PURITY_LINK_TOKEN,
+        f'<a href="{PURITY_LINK_URL}">查看纯净度</a>',
     )
 
 
