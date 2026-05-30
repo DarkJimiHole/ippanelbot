@@ -43,9 +43,8 @@ sudo bash ippanelbot.sh install
 6. 重启
 7. 查看状态
 8. 查看日志
-9. 列出面板 VPS
-10. 配置中转同步
-11. 卸载
+9. 配置中转同步
+10. 卸载
 0. 退出
 ```
 
@@ -55,7 +54,6 @@ sudo bash ippanelbot.sh install
 sudo boil install
 sudo boil config
 sudo boil update
-sudo boil list-vps
 sudo boil relay
 sudo boil start
 sudo boil stop

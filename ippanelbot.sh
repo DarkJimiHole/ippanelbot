@@ -55,7 +55,6 @@ ${APP_NAME} 管理脚本
   sudo boil install
   sudo boil config
   sudo boil update
-  sudo boil list-vps
   sudo boil relay
   sudo boil start|stop|restart|status|logs
   sudo boil uninstall
@@ -701,6 +700,19 @@ run_bot_cli() {
   chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR" >/dev/null 2>&1 || true
 }
 
+run_relay_config() {
+  require_root "$@"
+  require_installed
+  info "扩展组件：中转同步"
+  info "项目地址：https://github.com/DarkJimiHole/ippanelreceiver"
+  info "说明：配合安装在中转 VPS 上的 ippanelreceiver，在换 IP 成功后上报新 IP，并由 receiver 调用 easynftables 更新转发目标。"
+  if [ "$(env_value RELAY_SYNC_ENABLED || true)" != "1" ]; then
+    warn "当前未开启中转同步。请先运行 sudo boil config，将“启用中转同步”设置为 1。"
+    return 1
+  fi
+  run_bot_cli relay "$@"
+}
+
 run_service_action() {
   local action="$1"
   require_root "$@"
@@ -726,9 +738,8 @@ run_menu() {
     printf "  6) 重启\n"
     printf "  7) 查看状态\n"
     printf "  8) 查看日志\n"
-    printf "  9) 列出面板 VPS\n"
-    printf " 10) 配置中转同步\n"
-    printf " 11) 卸载\n"
+    printf "  9) 配置中转同步\n"
+    printf " 10) 卸载\n"
     printf "  0) 退出\n"
     read -r -p "请选择: " choice
     case "$choice" in
@@ -740,9 +751,8 @@ run_menu() {
       6) menu_require_installed && run_service_action restart ;;
       7) menu_require_installed && run_status ;;
       8) menu_require_installed && run_logs ;;
-      9) menu_require_installed && run_bot_cli list-vps ;;
-      10) menu_require_installed && run_bot_cli relay ;;
-      11) run_uninstall ;;
+      9) menu_require_installed && run_relay_config ;;
+      10) run_uninstall ;;
       0) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -756,8 +766,7 @@ main() {
     install) run_install "$@" ;;
     config|configure|modify) run_config "$@" ;;
     update|upgrade) run_update "$@" ;;
-    list-vps|vps) run_bot_cli list-vps "$@" ;;
-    relay) run_bot_cli relay "$@" ;;
+    relay) run_relay_config "$@" ;;
     start|stop|restart) run_service_action "$cmd" "$@" ;;
     status) run_status "$@" ;;
     logs|log) run_logs "$@" ;;

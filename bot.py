@@ -327,6 +327,16 @@ def relay_host_label(receiver_url: str) -> str:
     return parsed.hostname or parsed.netloc or receiver_url
 
 
+def relay_match_mode_label(value: str) -> str:
+    mode = normalize_relay_match_mode(value)
+    labels = {
+        "remark": "remark（按目标备注）",
+        "old_ip": "old_ip（按旧目标 IP）",
+        "old_ip_unique": "old_ip_unique（按唯一旧目标 IP）",
+    }
+    return labels[mode]
+
+
 def relay_binding_matches_zone(binding: RelayBinding, zone: ZoneItem) -> bool:
     return (
         binding.router_id == zone.router_id
@@ -2559,10 +2569,13 @@ class BotApp:
                 ]
                 if matched:
                     lines.append(f"   绑定结果：已绑定 {len(matched)} 个")
-                    for binding in matched:
-                        lines.append(f"   中转 VPS：{relay_host_label(binding.receiver_url)}")
-                        lines.append(f"   目标名称：{binding.receiver_target_name}")
-                        lines.append(f"   匹配模式：{binding.match_mode}")
+                    for binding_index, binding in enumerate(matched, start=1):
+                        lines.append(f"   绑定 {binding_index}")
+                        lines.append(f"      中转 VPS：{relay_host_label(binding.receiver_url)}")
+                        lines.append(f"      目标名称：{binding.receiver_target_name}")
+                        lines.append(f"      匹配模式：{relay_match_mode_label(binding.match_mode)}")
+                        if binding_index < len(matched):
+                            lines.append("")
                     if zone.current_ip:
                         test_rows.append(
                             [
@@ -2643,10 +2656,6 @@ class BotApp:
                 lines.append("")
                 for index, binding in enumerate(matched, start=1):
                     old_ip = zone.current_ip if binding.match_mode in {"old_ip", "old_ip_unique"} else ""
-                    label = (
-                        f"{relay_host_label(binding.receiver_url)} / "
-                        f"{binding.receiver_target_name} / {binding.match_mode}"
-                    )
                     try:
                         post_relay_report(binding, zone.current_ip, old_ip=old_ip)
                         self.store.update_relay_result(binding.id, zone.current_ip, "")
@@ -2655,8 +2664,12 @@ class BotApp:
                         logging.exception("Relay sync test failed")
                         self.store.update_relay_result(binding.id, zone.current_ip, str(exc))
                         result = f"失败：{exc}"
-                    lines.append(f"{index}. {label}")
+                    lines.append(f"{index}. 中转 VPS：{relay_host_label(binding.receiver_url)}")
+                    lines.append(f"   目标名称：{binding.receiver_target_name}")
+                    lines.append(f"   匹配模式：{relay_match_mode_label(binding.match_mode)}")
                     lines.append(f"   结果：{result}")
+                    if index < len(matched):
+                        lines.append("")
 
             rows = [
                 [
@@ -3140,15 +3153,20 @@ class BotApp:
 
         lines = ["中转同步结果"]
         for index, binding in enumerate(matched, start=1):
-            label = f"{relay_host_label(binding.receiver_url)} / {binding.receiver_target_name} / {binding.match_mode}"
             try:
                 post_relay_report(binding, new_ip, old_ip=old_ip)
                 self.store.update_relay_result(binding.id, new_ip, "")
-                lines.append(f"{index}. {label}：已上报")
+                result = "已上报"
             except Exception as exc:
                 logging.exception("Relay sync failed")
                 self.store.update_relay_result(binding.id, new_ip, str(exc))
-                lines.append(f"{index}. {label}：失败：{exc}")
+                result = f"失败：{exc}"
+            lines.append(f"{index}. 中转 VPS：{relay_host_label(binding.receiver_url)}")
+            lines.append(f"   目标名称：{binding.receiver_target_name}")
+            lines.append(f"   匹配模式：{relay_match_mode_label(binding.match_mode)}")
+            lines.append(f"   结果：{result}")
+            if index < len(matched):
+                lines.append("")
         return "\n".join(lines)
 
     def sync_ddns_binding_with_current_ip(self, binding: DdnsBinding) -> str:
