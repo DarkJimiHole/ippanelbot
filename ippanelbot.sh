@@ -710,7 +710,23 @@ run_relay_config() {
     warn "当前未开启中转同步。请先运行 sudo boil config，将“启用中转同步”设置为 1。"
     return 1
   fi
-  run_bot_cli relay "$@"
+  while true; do
+    printf "\n%b中转同步管理%b\n" "$GREEN" "$RESET"
+    printf "  1) 查看绑定\n"
+    printf "  2) 添加绑定\n"
+    printf "  3) 修改绑定\n"
+    printf "  4) 删除绑定\n"
+    printf "  0) 返回\n"
+    read -r -p "请选择: " relay_choice
+    case "$relay_choice" in
+      1) run_bot_cli relay-list ;;
+      2) run_bot_cli relay ;;
+      3) run_bot_cli relay-edit ;;
+      4) run_bot_cli relay-delete ;;
+      0) return 0 ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
 }
 
 run_service_action() {

@@ -79,9 +79,10 @@ sudo boil uninstall
 
 Relay sync is configured only on the VPS, not in Telegram. When relay sync is
 enabled, `/ip` shows a button for checking whether each VPS has a local relay
-binding. Telegram only shows the binding result, relay VPS host, target name,
-and match mode. If a binding is valid, Telegram also shows a test button that
-sends the current public IP once through the same signed relay sync path.
+binding. Telegram only shows the binding result, target name, and match mode.
+If a binding is valid, Telegram also shows a test button that sends one check
+through the selected match mode. The `sudo boil relay` menu can view, add,
+modify, and delete relay bindings.
 
 ## What The Script Manages
 
