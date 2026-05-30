@@ -627,31 +627,73 @@ def validate_hostname(hostname: str) -> str:
 
 
 AUTO_LINK_RE = re.compile(
-    r"(?<![\w/])((?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,})(?![\w/])"
+    r"(?<![\w/])((?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,})(?![\w/.])"
 )
-PURITY_LINK_TOKEN = "__IPPANELBOT_PURITY_LINK__"
-PURITY_LINK_URL = "https://www.iplark.com/ip"
+PURITY_LINK_RE = re.compile(r"www\.iplark\.com/((?:\d{1,3}\.){3}\d{1,3})")
 
 
 def tg_bold(text: str) -> str:
     return str(text)
 
 
-def purity_link_line() -> str:
-    return f"IP 纯净度：{PURITY_LINK_TOKEN}"
+def purity_link_line(ip: str) -> str:
+    return f"IP 纯净度：www.iplark.com/{ip}"
 
 
-def apply_html_tokens(text: str) -> str:
-    return text.replace(
-        PURITY_LINK_TOKEN,
-        f'<a href="{PURITY_LINK_URL}">查看纯净度</a>',
+def apply_purity_links(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        display_url = match.group(0)
+        href = f"https://{display_url}"
+        return f'<a href="{href}">{display_url}</a>'
+
+    return PURITY_LINK_RE.sub(replace, text)
+
+
+def should_bold_html_line(line: str) -> bool:
+    plain = re.sub(r"<[^>]+>", "", line).strip()
+    if not plain:
+        return False
+    if line[:1].isspace():
+        return False
+    if re.match(r"^\d+\.\s+", plain):
+        return True
+    title_prefixes = (
+        "当前 IP 状态",
+        "中转同步绑定状态",
+        "中转同步结果",
+        "选择更换方式",
+        "确认更换",
+        "DDNS 管理",
+        "DDNS 绑定列表",
+        "DDNS 手动同步结果",
+        "未执行任务",
+        "计划任务",
     )
+    if plain.startswith(title_prefixes):
+        return True
+    return any(
+        marker in plain
+        for marker in (
+            "中转同步测试",
+            "更换请求已完成",
+            "更换失败",
+            "多次尝试后 IP 仍未变化",
+        )
+    )
+
+
+def apply_html_formatting(text: str) -> str:
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if should_bold_html_line(line):
+            lines[index] = f"<b>{line}</b>"
+    return "\n".join(lines)
 
 
 def telegram_html(text: str, code_autolinks: bool = True) -> str:
     text = str(text)
     if not code_autolinks:
-        return apply_html_tokens(html.escape(text, quote=False))
+        return apply_html_formatting(apply_purity_links(html.escape(text, quote=False)))
     parts: list[str] = []
     last = 0
     for match in AUTO_LINK_RE.finditer(text):
@@ -659,7 +701,7 @@ def telegram_html(text: str, code_autolinks: bool = True) -> str:
         parts.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
         last = match.end()
     parts.append(html.escape(text[last:], quote=False))
-    return apply_html_tokens("".join(parts))
+    return apply_html_formatting(apply_purity_links("".join(parts)))
 
 
 def schedule_description(job: ScheduledChange) -> str:
@@ -2014,7 +2056,7 @@ def format_change_result(
         lines.append(f"旧 IP：{old_ip}")
     if new_ip:
         lines.append(f"当前/新 IP：{new_ip}")
-        lines.append(purity_link_line())
+        lines.append(purity_link_line(str(new_ip)))
     elif reconnect_data.get("mac_mode"):
         lines.append("新 IP：面板已提交，请稍后再用 /ip 查询确认")
     else:
@@ -3240,7 +3282,7 @@ class BotApp:
             try:
                 post_relay_report(binding, new_ip, old_ip=old_ip)
                 self.store.update_relay_result(binding.id, new_ip, "")
-                result = "已上报"
+                result = "已更新转发目标"
             except Exception as exc:
                 logging.exception("Relay sync failed")
                 self.store.update_relay_result(binding.id, new_ip, str(exc))
