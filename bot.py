@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import http.cookiejar
+import argparse
 import calendar
+import getpass
+import hmac
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import signal
 import sqlite3
 import socket
@@ -18,6 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -72,6 +77,10 @@ class DdnsError(Exception):
     pass
 
 
+class RelaySyncError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_bot_token: str
@@ -93,6 +102,8 @@ class Config:
     cloudflare_zone_id: str
     ddns_ttl_seconds: int
     ddns_sync_after_change: bool
+    relay_sync_enabled: bool
+    relay_sync_after_change: bool
 
 
 @dataclass
@@ -158,6 +169,32 @@ class DdnsBinding:
     enabled: bool
 
 
+@dataclass
+class RelayBinding:
+    id: int
+    router_id: str
+    interface: str
+    internal_ip: str
+    target_name: str
+    receiver_url: str
+    reporter: str
+    secret: str
+    receiver_target_name: str
+    match_mode: str
+    last_ip: str
+    last_sync_at: int
+    last_error: str
+    enabled: bool
+
+
+@dataclass
+class ChangeContext:
+    zone_before: ZoneItem | None
+    reconnect_data: dict[str, Any]
+    payload_after: dict[str, Any] | None
+    zone_after: ZoneItem | None
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -213,6 +250,8 @@ def read_config() -> Config:
     cloudflare_zone_id = get("CLOUDFLARE_ZONE_ID")
     ddns_ttl_seconds = parse_int(get("DDNS_TTL_SECONDS", "60"), default=60)
     ddns_sync_after_change = parse_bool(get("DDNS_SYNC_AFTER_CHANGE", "1"), True)
+    relay_sync_enabled = parse_bool(get("RELAY_SYNC_ENABLED", "0"))
+    relay_sync_after_change = parse_bool(get("RELAY_SYNC_AFTER_CHANGE", "1"), True)
 
     return Config(
         telegram_bot_token=token,
@@ -234,6 +273,8 @@ def read_config() -> Config:
         cloudflare_zone_id=cloudflare_zone_id,
         ddns_ttl_seconds=normalize_cloudflare_ttl(ddns_ttl_seconds),
         ddns_sync_after_change=ddns_sync_after_change,
+        relay_sync_enabled=relay_sync_enabled,
+        relay_sync_after_change=relay_sync_after_change,
     )
 
 
@@ -264,6 +305,34 @@ def parse_bool(raw: Any, default: bool = False) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "y", "on", "enable", "enabled")
+
+
+def normalize_relay_match_mode(value: str) -> str:
+    mode = str(value or "remark").strip().lower()
+    if mode not in {"remark", "old_ip", "old_ip_unique"}:
+        raise ValueError("match_mode must be remark, old_ip, or old_ip_unique")
+    return mode
+
+
+def validate_relay_url(value: str) -> str:
+    url = str(value or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("receiver 地址必须是 http:// 或 https:// 开头的完整 URL。")
+    return url
+
+
+def relay_host_label(receiver_url: str) -> str:
+    parsed = urllib.parse.urlparse(receiver_url)
+    return parsed.hostname or parsed.netloc or receiver_url
+
+
+def relay_binding_matches_zone(binding: RelayBinding, zone: ZoneItem) -> bool:
+    return (
+        binding.router_id == zone.router_id
+        and binding.interface == zone.interface
+        and binding.internal_ip == zone.dedicated_ip
+    )
 
 
 def normalize_cloudflare_ttl(raw: int) -> int:
@@ -712,6 +781,35 @@ class BotStore:
             ON ddns_bindings (chat_id, enabled, id)
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relay_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                router_id TEXT NOT NULL,
+                interface TEXT NOT NULL,
+                internal_ip TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                receiver_url TEXT NOT NULL,
+                reporter TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                receiver_target_name TEXT NOT NULL,
+                match_mode TEXT NOT NULL DEFAULT 'remark',
+                last_ip TEXT NOT NULL DEFAULT '',
+                last_sync_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(router_id, interface, internal_ip, receiver_url, receiver_target_name)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_relay_bindings_zone
+            ON relay_bindings (router_id, interface, enabled, id)
+            """
+        )
         self.conn.commit()
 
     def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
@@ -980,6 +1078,119 @@ class BotStore:
         self.conn.commit()
         return cur.rowcount == 1
 
+    def upsert_relay_binding(
+        self,
+        router_id: str,
+        interface: str,
+        internal_ip: str,
+        target_name: str,
+        receiver_url: str,
+        reporter: str,
+        secret: str,
+        receiver_target_name: str,
+        match_mode: str = "remark",
+    ) -> int:
+        now = int(time.time())
+        existing = self.conn.execute(
+            """
+            SELECT id FROM relay_bindings
+            WHERE router_id = ? AND interface = ? AND internal_ip = ?
+              AND receiver_url = ? AND receiver_target_name = ?
+            """,
+            (
+                str(router_id),
+                str(interface),
+                str(internal_ip),
+                receiver_url,
+                receiver_target_name,
+            ),
+        ).fetchone()
+        if existing:
+            binding_id = int(existing["id"])
+            self.conn.execute(
+                """
+                UPDATE relay_bindings
+                SET target_name = ?, reporter = ?, secret = ?, match_mode = ?,
+                    enabled = 1, last_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target_name.strip() or "目标机器",
+                    reporter,
+                    secret,
+                    normalize_relay_match_mode(match_mode),
+                    now,
+                    binding_id,
+                ),
+            )
+            self.conn.commit()
+            return binding_id
+
+        cur = self.conn.execute(
+            """
+            INSERT INTO relay_bindings
+              (router_id, interface, internal_ip, target_name, receiver_url, reporter, secret,
+               receiver_target_name, match_mode, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                str(router_id),
+                str(interface),
+                str(internal_ip),
+                target_name.strip() or "目标机器",
+                receiver_url,
+                reporter,
+                secret,
+                receiver_target_name,
+                normalize_relay_match_mode(match_mode),
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_relay_bindings(self) -> list[RelayBinding]:
+        rows = self.conn.execute(
+            """
+            SELECT id, router_id, interface, internal_ip, target_name, receiver_url,
+                   reporter, secret, receiver_target_name, match_mode, last_ip,
+                   last_sync_at, last_error, enabled
+            FROM relay_bindings
+            WHERE enabled = 1
+            ORDER BY id
+            """
+        ).fetchall()
+        return [self._relay_binding_from_row(row) for row in rows]
+
+    def list_relay_bindings_for_zone(
+        self, router_id: str, interface: str
+    ) -> list[RelayBinding]:
+        rows = self.conn.execute(
+            """
+            SELECT id, router_id, interface, internal_ip, target_name, receiver_url,
+                   reporter, secret, receiver_target_name, match_mode, last_ip,
+                   last_sync_at, last_error, enabled
+            FROM relay_bindings
+            WHERE router_id = ? AND interface = ? AND enabled = 1
+            ORDER BY id
+            """,
+            (str(router_id), str(interface)),
+        ).fetchall()
+        return [self._relay_binding_from_row(row) for row in rows]
+
+    def update_relay_result(self, binding_id: int, ip: str, error: str = "") -> None:
+        now = int(time.time())
+        self.conn.execute(
+            """
+            UPDATE relay_bindings
+            SET last_ip = ?, last_sync_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (str(ip), now, error[:1000], now, int(binding_id)),
+        )
+        self.conn.commit()
+
     def _scheduled_change_from_row(self, row: sqlite3.Row) -> ScheduledChange:
         return ScheduledChange(
             id=int(row["id"]),
@@ -1012,6 +1223,24 @@ class BotStore:
             proxied=bool(parse_int(row["proxied"], 0)),
             last_ip=str(row["last_ip"] or ""),
             last_update_at=parse_int(row["last_update_at"], 0),
+            enabled=bool(parse_int(row["enabled"], 1)),
+        )
+
+    def _relay_binding_from_row(self, row: sqlite3.Row) -> RelayBinding:
+        return RelayBinding(
+            id=int(row["id"]),
+            router_id=str(row["router_id"]),
+            interface=str(row["interface"]),
+            internal_ip=str(row["internal_ip"] or ""),
+            target_name=str(row["target_name"] or "目标机器"),
+            receiver_url=str(row["receiver_url"] or ""),
+            reporter=str(row["reporter"] or ""),
+            secret=str(row["secret"] or ""),
+            receiver_target_name=str(row["receiver_target_name"] or ""),
+            match_mode=normalize_relay_match_mode(str(row["match_mode"] or "remark")),
+            last_ip=str(row["last_ip"] or ""),
+            last_sync_at=parse_int(row["last_sync_at"], 0),
+            last_error=str(row["last_error"] or ""),
             enabled=bool(parse_int(row["enabled"], 1)),
         )
 
@@ -1313,6 +1542,56 @@ def cloudflare_error_message(payload: dict[str, Any], fallback: str) -> str:
         if messages:
             return "Cloudflare API error: " + "; ".join(messages[:3])
     return fallback
+
+
+def post_relay_report(
+    binding: RelayBinding,
+    new_ip: str,
+    old_ip: str = "",
+    timeout: int = 20,
+) -> None:
+    receiver_url = validate_relay_url(binding.receiver_url)
+    payload: dict[str, Any] = {
+        "reporter": binding.reporter,
+        "target_name": binding.receiver_target_name,
+        "match_mode": normalize_relay_match_mode(binding.match_mode),
+        "ip": new_ip,
+        "ts": int(time.time()),
+        "nonce": secrets.token_hex(12),
+    }
+    if old_ip:
+        payload["old_ip"] = old_ip
+    raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(binding.secret.encode("utf-8"), raw_body, sha256).hexdigest()
+    request = urllib.request.Request(
+        receiver_url,
+        data=raw_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-IPPanelReceiver-Signature": f"sha256={signature}",
+            "User-Agent": f"ippanelbot/{APP_VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        raise RelaySyncError(f"receiver network error: {reason}") from exc
+
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        snippet = raw[:200].decode("utf-8", errors="replace").replace("\n", " ")
+        raise RelaySyncError(f"receiver returned non-JSON response: HTTP {status}: {snippet}") from exc
+    if status >= 400 or not data.get("ok"):
+        detail = data.get("detail") or data.get("error") or f"HTTP {status}"
+        raise RelaySyncError(str(detail))
 
 
 class TelegramApi:
@@ -1739,6 +2018,7 @@ class BotApp:
         )
         self.stop_requested = False
         self.changing: set[tuple[str, str]] = set()
+        self.last_change_context: dict[tuple[str, str], ChangeContext] = {}
         self.pending_inputs: dict[int, dict[str, str]] = {}
         self.timezone = load_timezone(config.timezone_name)
         self.panel_photo_file_id = ""
@@ -1870,6 +2150,15 @@ class BotApp:
         elif action == "ip_page":
             self.telegram.answer_callback_query(callback_id)
             self.send_status(chat_id, parse_int(router_id, 0), editable_message_id)
+        elif action == "relay_status":
+            self.telegram.answer_callback_query(callback_id)
+            self.send_relay_status(chat_id, parse_int(router_id, 0), editable_message_id)
+        elif action == "relay_page":
+            self.telegram.answer_callback_query(callback_id)
+            self.send_relay_status(chat_id, parse_int(router_id, 0), editable_message_id)
+        elif action == "relay_test":
+            self.telegram.answer_callback_query(callback_id, "开始测试")
+            self.test_relay_sync(chat_id, router_id, interface, editable_message_id)
         elif action == "cmd_change":
             self.telegram.answer_callback_query(callback_id)
             self.send_change_menu(chat_id)
@@ -2209,6 +2498,15 @@ class BotApp:
             page = clamp_page(page, len(zones))
             rows = pagination_rows("ip_page", page, len(zones))
             rows.append([{"text": "更换 IP", "callback_data": callback_data("cmd_change", "", "")}])
+            if self.config.relay_sync_enabled:
+                rows.append(
+                    [
+                        {
+                            "text": "检查中转同步",
+                            "callback_data": callback_data("relay_status", str(page), ""),
+                        }
+                    ]
+                )
             keyboard = {"inline_keyboard": rows}
             reply_markup = keyboard if keyboard["inline_keyboard"] else None
             self.send_or_edit(
@@ -2222,6 +2520,164 @@ class BotApp:
         except Exception as exc:
             logging.exception("Status command failed")
             self.send_or_edit(chat_id, message_id, f"查询出错：{exc}")
+
+    def send_relay_status(
+        self, chat_id: int, page: int = 0, message_id: int | None = None
+    ) -> None:
+        if not self.config.relay_sync_enabled:
+            self.send_or_edit(chat_id, message_id, "中转同步未启用。请在 VPS 上运行 sudo boil config 开启。")
+            return
+        try:
+            payload = self.panel.query_all()
+            if payload.get("error"):
+                self.send_or_edit(chat_id, message_id, f"查询失败：{payload.get('error')}")
+                return
+            zones = parse_zones(payload)
+            if not zones:
+                self.send_or_edit(chat_id, message_id, "没有从面板查到机器。")
+                return
+            page = clamp_page(page, len(zones))
+            pages = total_pages(len(zones))
+            lines = ["中转同步绑定状态", ""]
+            if pages > 1:
+                lines.append(f"第 {page + 1}/{pages} 页，共 {len(zones)} 台")
+                lines.append("")
+
+            start = page * PAGE_SIZE
+            page_zones = zones[start : start + PAGE_SIZE]
+            test_rows: list[list[dict[str, str]]] = []
+            for offset, zone in enumerate(page_zones, start=1):
+                index = start + offset
+                lines.append(f"{index}. {zone.display_name}")
+                all_bindings = self.store.list_relay_bindings_for_zone(
+                    zone.router_id, zone.interface
+                )
+                matched = [
+                    binding
+                    for binding in all_bindings
+                    if relay_binding_matches_zone(binding, zone)
+                ]
+                if matched:
+                    lines.append(f"   绑定结果：已绑定 {len(matched)} 个")
+                    for binding in matched:
+                        lines.append(f"   中转 VPS：{relay_host_label(binding.receiver_url)}")
+                        lines.append(f"   目标名称：{binding.receiver_target_name}")
+                        lines.append(f"   匹配模式：{binding.match_mode}")
+                    if zone.current_ip:
+                        test_rows.append(
+                            [
+                                {
+                                    "text": f"测试同步：{short_text(zone.display_name, 24)}",
+                                    "callback_data": callback_data(
+                                        "relay_test", zone.router_id, zone.interface
+                                    ),
+                                }
+                            ]
+                        )
+                    else:
+                        lines.append("   测试同步：面板没有返回当前公网 IP")
+                elif all_bindings:
+                    lines.append("   绑定结果：绑定失效，内网 IP 不匹配")
+                else:
+                    lines.append("   绑定结果：未绑定")
+                lines.append("")
+
+            rows = pagination_rows("relay_page", page, len(zones))
+            rows.extend(test_rows)
+            rows.append([{"text": "更换 IP", "callback_data": callback_data("cmd_change", "", "")}])
+            self.send_or_edit(
+                chat_id,
+                message_id,
+                "\n".join(lines).strip(),
+                reply_markup={"inline_keyboard": rows},
+            )
+        except IppanelError as exc:
+            self.send_or_edit(chat_id, message_id, f"面板请求失败：{exc}")
+        except Exception as exc:
+            logging.exception("Relay status failed")
+            self.send_or_edit(chat_id, message_id, f"检查中转同步失败：{exc}")
+
+    def test_relay_sync(
+        self,
+        chat_id: int,
+        router_id: str,
+        interface: str,
+        message_id: int | None = None,
+    ) -> None:
+        if not self.config.relay_sync_enabled:
+            self.send_or_edit(chat_id, message_id, "中转同步未启用。请在 VPS 上运行 sudo boil config 开启。")
+            return
+        try:
+            payload = self.panel.query_all(force=True)
+            if payload.get("error"):
+                self.send_or_edit(chat_id, message_id, f"查询失败：{payload.get('error')}")
+                return
+            zones = parse_zones(payload)
+            zone = find_zone(zones, router_id, interface)
+            if not zone:
+                self.send_or_edit(chat_id, message_id, "面板里没有找到这台 VPS。")
+                return
+            zone_index = next(
+                (
+                    index
+                    for index, item in enumerate(zones)
+                    if item.router_id == str(router_id) and item.interface == str(interface)
+                ),
+                0,
+            )
+            return_page = zone_index // PAGE_SIZE
+
+            bindings = self.store.list_relay_bindings_for_zone(router_id, interface)
+            matched = [
+                binding for binding in bindings if relay_binding_matches_zone(binding, zone)
+            ]
+            lines = [f"{zone.display_name} 中转同步测试", ""]
+            if not bindings:
+                lines.append("绑定结果：未绑定")
+            elif not matched:
+                lines.append("绑定结果：绑定失效，内网 IP 不匹配")
+            elif not zone.current_ip:
+                lines.append("测试结果：失败，面板没有返回当前公网 IP。")
+            else:
+                lines.append("测试方式：使用当前公网 IP 发送一次同步上报。")
+                lines.append("")
+                for index, binding in enumerate(matched, start=1):
+                    old_ip = zone.current_ip if binding.match_mode in {"old_ip", "old_ip_unique"} else ""
+                    label = (
+                        f"{relay_host_label(binding.receiver_url)} / "
+                        f"{binding.receiver_target_name} / {binding.match_mode}"
+                    )
+                    try:
+                        post_relay_report(binding, zone.current_ip, old_ip=old_ip)
+                        self.store.update_relay_result(binding.id, zone.current_ip, "")
+                        result = "成功"
+                    except Exception as exc:
+                        logging.exception("Relay sync test failed")
+                        self.store.update_relay_result(binding.id, zone.current_ip, str(exc))
+                        result = f"失败：{exc}"
+                    lines.append(f"{index}. {label}")
+                    lines.append(f"   结果：{result}")
+
+            rows = [
+                [
+                    {
+                        "text": "返回检查结果",
+                        "callback_data": callback_data("relay_status", str(return_page), ""),
+                    },
+                    {"text": "更换 IP", "callback_data": callback_data("cmd_change", "", "")},
+                ]
+            ]
+            self.send_or_edit(
+                chat_id,
+                message_id,
+                "\n".join(lines).strip(),
+                reply_markup={"inline_keyboard": rows},
+            )
+        except IppanelError as exc:
+            self.send_or_edit(chat_id, message_id, f"面板请求失败：{exc}")
+        except Exception as exc:
+            logging.exception("Relay sync test command failed")
+            self.send_or_edit(chat_id, message_id, f"测试中转同步失败：{exc}")
 
     def send_change_menu(self, chat_id: int, page: int = 0, message_id: int | None = None) -> None:
         self.pending_inputs.pop(chat_id, None)
@@ -2589,6 +3045,12 @@ class BotApp:
                 logging.exception("Post-change query failed")
 
             result = format_change_result(zone_before, reconnect_data, payload_after, zone_after)
+            self.last_change_context[key] = ChangeContext(
+                zone_before=zone_before,
+                reconnect_data=dict(reconnect_data),
+                payload_after=payload_after,
+                zone_after=zone_after,
+            )
             if attempts_used > 1:
                 result += f"\n尝试次数：{attempts_used}/{self.config.change_max_attempts}"
             return result
@@ -2605,6 +3067,9 @@ class BotApp:
             ddns_result = self.sync_ddns_after_change(chat_id, router_id, interface)
             if ddns_result:
                 result = f"{result}\n\n{ddns_result}"
+            relay_result = self.sync_relay_after_change(router_id, interface)
+            if relay_result:
+                result = f"{result}\n\n{relay_result}"
             self.telegram.edit_message_text(
                 chat_id, message_id, telegram_html(result), parse_mode="HTML"
             )
@@ -2629,6 +3094,62 @@ class BotApp:
         except Exception as exc:
             logging.exception("DDNS sync after change failed")
             return f"DDNS 同步失败：{exc}"
+
+    def sync_relay_after_change(self, router_id: str, interface: str) -> str:
+        if not (self.config.relay_sync_enabled and self.config.relay_sync_after_change):
+            return ""
+        key = (str(router_id), str(interface))
+        context = self.last_change_context.get(key)
+        reconnect_data = context.reconnect_data if context else {}
+        if reconnect_data.get("error") or reconnect_data.get("ip_unchanged"):
+            return ""
+
+        bindings = self.store.list_relay_bindings_for_zone(router_id, interface)
+        if not bindings:
+            return ""
+
+        zone = context.zone_after if context else None
+        if not zone:
+            try:
+                payload = self.panel.query_all(force=True)
+                zone = find_zone(parse_zones(payload), router_id, interface)
+            except Exception as exc:
+                logging.exception("Relay sync post-change query failed")
+                return f"中转同步失败：无法确认当前 VPS 状态：{exc}"
+        if not zone:
+            return "中转同步失败：面板里没有找到已绑定的 VPS。"
+        if not zone.dedicated_ip:
+            return "中转同步失败：面板没有返回内网 IP，无法校验绑定。"
+
+        matched = [
+            binding for binding in bindings if relay_binding_matches_zone(binding, zone)
+        ]
+        if not matched:
+            return "中转同步跳过：绑定指纹不匹配，请在 VPS 上重新运行 sudo boil relay。"
+
+        new_ip = (
+            str(reconnect_data.get("new_ip") or "").strip()
+            or zone.current_ip
+        )
+        old_ip = (
+            str(reconnect_data.get("old_ip") or "").strip()
+            or (context.zone_before.current_ip if context and context.zone_before else "")
+        )
+        if not new_ip:
+            return "中转同步失败：面板没有返回当前公网 IP。"
+
+        lines = ["中转同步结果"]
+        for index, binding in enumerate(matched, start=1):
+            label = f"{relay_host_label(binding.receiver_url)} / {binding.receiver_target_name} / {binding.match_mode}"
+            try:
+                post_relay_report(binding, new_ip, old_ip=old_ip)
+                self.store.update_relay_result(binding.id, new_ip, "")
+                lines.append(f"{index}. {label}：已上报")
+            except Exception as exc:
+                logging.exception("Relay sync failed")
+                self.store.update_relay_result(binding.id, new_ip, str(exc))
+                lines.append(f"{index}. {label}：失败：{exc}")
+        return "\n".join(lines)
 
     def sync_ddns_binding_with_current_ip(self, binding: DdnsBinding) -> str:
         error = self.ddns_config_error()
@@ -2953,6 +3474,9 @@ class BotApp:
                 )
                 if ddns_result:
                     result = f"{result}\n\n{ddns_result}"
+                relay_result = self.sync_relay_after_change(job.router_id, job.interface)
+                if relay_result:
+                    result = f"{result}\n\n{relay_result}"
                 next_run_at = next_recurring_run_at(job, int(time.time()))
                 if next_run_at:
                     self.store.reschedule_scheduled_change(job.id, next_run_at)
@@ -3043,7 +3567,119 @@ def configure_logging(level: str) -> None:
     )
 
 
+def make_panel_client(config: Config) -> IppanelClient:
+    return IppanelClient(
+        config.ippanel_base_url,
+        config.ippanel_account,
+        config.ippanel_password,
+        config.query_cache_seconds,
+    )
+
+
+def cli_print_vps_list(zones: list[ZoneItem]) -> None:
+    if not zones:
+        print("没有从面板查到 VPS。")
+        return
+    for index, zone in enumerate(zones, start=1):
+        print(f"{index}. {zone.display_name}")
+        print(f"   当前公网 IP: {zone.current_ip or '未找到'}")
+        print(f"   内网 IP: {zone.dedicated_ip or '未返回'}")
+        print(f"   router_id: {zone.router_id}")
+        print(f"   interface: {zone.interface}")
+        print(f"   状态: {status_label(zone)}")
+
+
+def cli_list_vps(config: Config) -> int:
+    panel = make_panel_client(config)
+    payload = panel.query_all(force=True)
+    cli_print_vps_list(parse_zones(payload))
+    return 0
+
+
+def prompt_cli(label: str, default: str = "", required: bool = False, secret: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default else ""
+        prompt = f"{label}{suffix}: "
+        value = getpass.getpass(prompt) if secret else input(prompt)
+        value = value.strip() or default
+        if required and not value:
+            print(f"{label} 不能为空。")
+            continue
+        return value
+
+
+def prompt_cli_int(label: str, minimum: int, maximum: int) -> int:
+    while True:
+        value = input(label).strip()
+        if value.isdigit() and minimum <= int(value) <= maximum:
+            return int(value)
+        print(f"请输入 {minimum}-{maximum} 之间的数字。")
+
+
+def cli_configure_relay(config: Config) -> int:
+    panel = make_panel_client(config)
+    payload = panel.query_all(force=True)
+    zones = parse_zones(payload)
+    if not zones:
+        print("没有从面板查到 VPS，无法配置中转同步。")
+        return 1
+
+    print("请选择要绑定中转同步的 Boil VPS：")
+    cli_print_vps_list(zones)
+    choice = prompt_cli_int("请输入序号: ", 1, len(zones))
+    zone = zones[choice - 1]
+    if not zone.dedicated_ip:
+        print("这台 VPS 没有返回内网 IP，无法创建安全绑定。")
+        return 1
+
+    print("")
+    print("请输入 ippanelreceiver 信息。")
+    print("项目地址：https://github.com/DarkJimiHole/ippanelreceiver")
+    receiver_url = validate_relay_url(prompt_cli("Receiver 上报地址", required=True))
+    reporter = prompt_cli("Reporter ID", "bot-main", required=True)
+    secret = prompt_cli("上报密钥", required=True, secret=True)
+    receiver_target_name = prompt_cli("target_name", "target1", required=True)
+    match_mode = normalize_relay_match_mode(
+        prompt_cli("匹配模式 remark/old_ip/old_ip_unique", "remark", required=True)
+    )
+
+    store = BotStore(config.db_path)
+    try:
+        binding_id = store.upsert_relay_binding(
+            router_id=zone.router_id,
+            interface=zone.interface,
+            internal_ip=zone.dedicated_ip,
+            target_name=zone.display_name,
+            receiver_url=receiver_url,
+            reporter=reporter,
+            secret=secret,
+            receiver_target_name=receiver_target_name,
+            match_mode=match_mode,
+        )
+    finally:
+        store.close()
+
+    print("")
+    print(f"中转同步绑定已保存：#{binding_id}")
+    print(f"目标 VPS: {zone.display_name}")
+    print(f"中转 VPS: {relay_host_label(receiver_url)}")
+    print(f"target_name: {receiver_target_name}")
+    print(f"匹配模式: {match_mode}")
+    print("Telegram 里只会显示绑定结果、中转 VPS、目标名称和匹配模式。")
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="IPPanelBot")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=("run", "list-vps", "relay"),
+        help="run bot, list panel VPS, or configure relay sync",
+    )
+    args = parser.parse_args()
+
     try:
         config = read_config()
     except ConfigError as exc:
@@ -3051,6 +3687,11 @@ def main() -> int:
         return 2
 
     configure_logging(config.log_level)
+    if args.command == "list-vps":
+        return cli_list_vps(config)
+    if args.command == "relay":
+        return cli_configure_relay(config)
+
     try:
         app = BotApp(config)
     except ConfigError as exc:

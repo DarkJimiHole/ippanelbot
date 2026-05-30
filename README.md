@@ -16,6 +16,7 @@ The bot uses Telegram long polling and the panel backend APIs, so you can query 
 - Store delayed and scheduled tasks in SQLite
 - Optional Cloudflare DDNS per VPS
 - Configurable Cloudflare DDNS TTL
+- Optional relay sync to IPPanelReceiver for updating easynftables targets
 - Auto-create Telegram command menu on startup
 - Command `boil`
 
@@ -42,7 +43,9 @@ sudo bash ippanelbot.sh install
 6. 重启
 7. 查看状态
 8. 查看日志
-9. 卸载
+9. 列出面板 VPS
+10. 配置中转同步
+11. 卸载
 0. 退出
 ```
 
@@ -52,6 +55,8 @@ sudo bash ippanelbot.sh install
 sudo boil install
 sudo boil config
 sudo boil update
+sudo boil list-vps
+sudo boil relay
 sudo boil start
 sudo boil stop
 sudo boil restart
@@ -73,6 +78,12 @@ sudo boil uninstall
 /cancel
 /help
 ```
+
+Relay sync is configured only on the VPS, not in Telegram. When relay sync is
+enabled, `/ip` shows a button for checking whether each VPS has a local relay
+binding. Telegram only shows the binding result, relay VPS host, target name,
+and match mode. If a binding is valid, Telegram also shows a test button that
+sends the current public IP once through the same signed relay sync path.
 
 ## What The Script Manages
 
@@ -102,6 +113,7 @@ During installation, the script asks for:
 - Telegram polling timeout seconds
 - DDNS switch
 - Cloudflare API token, Zone ID, and DNS TTL
+- relay sync switch
 
 When DDNS is enabled, the Telegram bot only asks for the hostname for each VPS. The bot stores the selected VPS by its internal panel identity and syncs the Cloudflare A record to that VPS current public IP.
 

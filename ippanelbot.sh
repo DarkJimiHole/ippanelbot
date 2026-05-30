@@ -55,6 +55,8 @@ ${APP_NAME} 管理脚本
   sudo boil install
   sudo boil config
   sudo boil update
+  sudo boil list-vps
+  sudo boil relay
   sudo boil start|stop|restart|status|logs
   sudo boil uninstall
 
@@ -401,6 +403,7 @@ write_config_interactive() {
   local token chat_ids base_url account password db_path
   local post_delay query_cache max_attempts retry_delay timezone poll_timeout panel_image log_level
   local ddns_enabled cloudflare_api_token cloudflare_zone_id ddns_ttl ddns_sync_after_change
+  local relay_sync_enabled relay_sync_after_change
   local old_timezone
 
   old_timezone="$(env_value TIMEZONE)"
@@ -465,6 +468,20 @@ write_config_interactive() {
     prompt_int ddns_sync_after_change "换 IP 成功后自动同步 DDNS，0=关闭，1=开启" "$ddns_sync_after_change" 0 1
   fi
 
+  echo ""
+  info "扩展组件：中转同步"
+  info "项目地址：https://github.com/DarkJimiHole/ippanelreceiver"
+  info "说明：配合安装在中转 VPS 上的 ippanelreceiver，在换 IP 成功后上报新 IP，并由 receiver 调用 easynftables 更新转发目标。"
+  warn "该组件默认关闭。开启前请先在中转 VPS 安装并配置 ippanelreceiver。"
+  relay_sync_enabled="$(env_value RELAY_SYNC_ENABLED || true)"
+  [ -n "$relay_sync_enabled" ] || relay_sync_enabled=0
+  prompt_int relay_sync_enabled "启用中转同步，0=关闭，1=开启" "$relay_sync_enabled" 0 1
+  relay_sync_after_change="$(env_value RELAY_SYNC_AFTER_CHANGE || true)"
+  [ -n "$relay_sync_after_change" ] || relay_sync_after_change=1
+  if [ "$relay_sync_enabled" = "1" ]; then
+    prompt_int relay_sync_after_change "换 IP 成功后自动上报中转同步，0=关闭，1=开启" "$relay_sync_after_change" 0 1
+  fi
+
   local tmp
   tmp="$(mktemp)"
   {
@@ -490,6 +507,9 @@ write_config_interactive() {
     printf "CLOUDFLARE_ZONE_ID=%s\n" "$(env_quote "$cloudflare_zone_id")"
     printf "DDNS_TTL_SECONDS=%s\n" "$(env_quote "$ddns_ttl")"
     printf "DDNS_SYNC_AFTER_CHANGE=%s\n" "$(env_quote "$ddns_sync_after_change")"
+    printf "\n"
+    printf "RELAY_SYNC_ENABLED=%s\n" "$(env_quote "$relay_sync_enabled")"
+    printf "RELAY_SYNC_AFTER_CHANGE=%s\n" "$(env_quote "$relay_sync_after_change")"
   } >"$tmp"
 
   install -m 600 -o root -g root "$tmp" "$ENV_FILE"
@@ -674,6 +694,13 @@ run_logs() {
   journalctl -u "$SERVICE_NAME" -f
 }
 
+run_bot_cli() {
+  require_root "$@"
+  require_installed
+  BOT_ENV_FILE="$ENV_FILE" /usr/bin/python3 "$APP_DIR/bot.py" "$@"
+  chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR" >/dev/null 2>&1 || true
+}
+
 run_service_action() {
   local action="$1"
   require_root "$@"
@@ -699,7 +726,9 @@ run_menu() {
     printf "  6) 重启\n"
     printf "  7) 查看状态\n"
     printf "  8) 查看日志\n"
-    printf "  9) 卸载\n"
+    printf "  9) 列出面板 VPS\n"
+    printf " 10) 配置中转同步\n"
+    printf " 11) 卸载\n"
     printf "  0) 退出\n"
     read -r -p "请选择: " choice
     case "$choice" in
@@ -711,7 +740,9 @@ run_menu() {
       6) menu_require_installed && run_service_action restart ;;
       7) menu_require_installed && run_status ;;
       8) menu_require_installed && run_logs ;;
-      9) run_uninstall ;;
+      9) menu_require_installed && run_bot_cli list-vps ;;
+      10) menu_require_installed && run_bot_cli relay ;;
+      11) run_uninstall ;;
       0) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -725,6 +756,8 @@ main() {
     install) run_install "$@" ;;
     config|configure|modify) run_config "$@" ;;
     update|upgrade) run_update "$@" ;;
+    list-vps|vps) run_bot_cli list-vps "$@" ;;
+    relay) run_bot_cli relay "$@" ;;
     start|stop|restart) run_service_action "$cmd" "$@" ;;
     status) run_status "$@" ;;
     logs|log) run_logs "$@" ;;
