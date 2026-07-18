@@ -7,6 +7,7 @@ import calendar
 import getpass
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -28,10 +29,13 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 PAGE_SIZE = 3
 PANEL_TRANSIENT_HTTP_STATUS = {502, 503, 504}
 PANEL_TRANSIENT_RETRY_DELAYS = (5, 15)
+API_INTERFACE = "api"
+API_TARGET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+API_CONFIRM_BACKOFF_SECONDS = (5, 10, 15, 30)
 
 
 class ConfigError(Exception):
@@ -85,9 +89,15 @@ class RelaySyncError(Exception):
 class Config:
     telegram_bot_token: str
     allowed_chat_ids: set[int]
+    ippanel_mode: str
     ippanel_base_url: str
     ippanel_account: str
     ippanel_password: str
+    ippanel_api_targets_file: Path
+    ippanel_api_targets: tuple["ApiTarget", ...]
+    api_change_initial_delay_seconds: int
+    api_change_poll_interval_seconds: int
+    api_change_confirm_timeout_seconds: int
     db_path: Path
     post_change_query_delay_seconds: int
     query_cache_seconds: int
@@ -113,6 +123,13 @@ class HttpResponse:
     content_type: str
     headers: dict[str, str]
     text: str
+
+
+@dataclass(frozen=True)
+class ApiTarget:
+    target_id: str
+    label: str
+    token: str
 
 
 @dataclass
@@ -195,6 +212,27 @@ class ChangeContext:
     zone_after: ZoneItem | None
 
 
+@dataclass
+class ApiChangeOperation:
+    id: int
+    chat_id: int
+    message_id: int
+    router_id: str
+    interface: str
+    target_name: str
+    old_ip: str
+    new_ip: str
+    requested_at: int
+    next_check_at: int
+    confirm_deadline: int
+    check_count: int
+    api_uses_left: int | None
+    next_allowed_at: int | None
+    status: str
+    last_error: str
+    scheduled_job_id: int | None
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -217,6 +255,42 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def load_api_targets(path: Path) -> tuple[ApiTarget, ...]:
+    if not path.exists():
+        raise ConfigError(f"API targets file not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read API targets file {path}: {exc}") from exc
+
+    if isinstance(raw, dict):
+        raw = raw.get("targets")
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("API targets file must contain a non-empty JSON array.")
+
+    targets: list[ApiTarget] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ConfigError(f"API target #{index} must be a JSON object.")
+        target_id = str(item.get("id") or "").strip()
+        label = str(item.get("name") or item.get("label") or target_id).strip()
+        token = str(item.get("token") or "").strip()
+        if not API_TARGET_ID_PATTERN.fullmatch(target_id):
+            raise ConfigError(
+                f"API target #{index} id must be 1-32 characters using letters, numbers, _ or -."
+            )
+        if target_id in seen_ids:
+            raise ConfigError(f"Duplicate API target id: {target_id}")
+        if not label:
+            raise ConfigError(f"API target '{target_id}' name must not be empty.")
+        if not token:
+            raise ConfigError(f"API target '{target_id}' token must not be empty.")
+        seen_ids.add(target_id)
+        targets.append(ApiTarget(target_id=target_id, label=label, token=token))
+    return tuple(targets)
+
+
 def read_config() -> Config:
     env_file = Path(os.environ.get("BOT_ENV_FILE", ".env"))
     env_values = load_env_file(env_file)
@@ -230,12 +304,33 @@ def read_config() -> Config:
 
     allowed_chat_ids = parse_chat_ids(get("TELEGRAM_ALLOWED_CHAT_IDS"))
 
+    panel_mode = get("IPPANEL_MODE", "legacy").lower()
+    if panel_mode not in {"legacy", "api"}:
+        raise ConfigError("IPPANEL_MODE must be legacy or api.")
+    base_url = get("IPPANEL_BASE_URL", "https://ippanel.boil.network").rstrip("/")
     account = get("IPPANEL_ACCOUNT")
     password = get("IPPANEL_PASSWORD")
-    if not account or not password:
-        raise ConfigError("IPPANEL_ACCOUNT and IPPANEL_PASSWORD are required.")
+    if panel_mode == "legacy" and (not account or not password):
+        raise ConfigError("IPPANEL_ACCOUNT and IPPANEL_PASSWORD are required in legacy mode.")
 
-    base_url = get("IPPANEL_BASE_URL", "https://ippanel.boil.network").rstrip("/")
+    api_targets_file = Path(
+        get("IPPANEL_API_TARGETS_FILE", "ippanel-api-targets.json")
+    ).expanduser()
+    if not api_targets_file.is_absolute():
+        api_targets_file = env_file.parent / api_targets_file
+    if panel_mode == "api":
+        api_targets = load_api_targets(api_targets_file)
+    elif api_targets_file.exists():
+        try:
+            api_targets = load_api_targets(api_targets_file)
+        except ConfigError:
+            api_targets = ()
+    else:
+        api_targets = ()
+    api_initial_delay = parse_int(get("API_CHANGE_INITIAL_DELAY_SECONDS", "5"), 5)
+    api_poll_interval = parse_int(get("API_CHANGE_POLL_INTERVAL_SECONDS", "30"), 30)
+    api_confirm_timeout = parse_int(get("API_CHANGE_CONFIRM_TIMEOUT_SECONDS", "300"), 300)
+
     db_path = Path(get("DB_PATH", "ippanel_bot.sqlite3")).expanduser()
     delay = parse_int(get("POST_CHANGE_QUERY_DELAY_SECONDS", "5"), default=5)
     query_cache_seconds = parse_int(get("QUERY_CACHE_SECONDS", "60"), default=60)
@@ -256,9 +351,15 @@ def read_config() -> Config:
     return Config(
         telegram_bot_token=token,
         allowed_chat_ids=allowed_chat_ids,
+        ippanel_mode=panel_mode,
         ippanel_base_url=base_url,
         ippanel_account=account,
         ippanel_password=password,
+        ippanel_api_targets_file=api_targets_file,
+        ippanel_api_targets=api_targets,
+        api_change_initial_delay_seconds=max(1, min(300, api_initial_delay)),
+        api_change_poll_interval_seconds=max(5, min(300, api_poll_interval)),
+        api_change_confirm_timeout_seconds=max(30, min(3600, api_confirm_timeout)),
         db_path=db_path,
         post_change_query_delay_seconds=max(0, delay),
         query_cache_seconds=max(0, query_cache_seconds),
@@ -296,6 +397,15 @@ def parse_int(raw: Any, default: int = 0) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def optional_int(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_bool(raw: Any, default: bool = False) -> bool:
@@ -338,11 +448,11 @@ def relay_match_mode_label(value: str) -> str:
 
 
 def relay_binding_matches_zone(binding: RelayBinding, zone: ZoneItem) -> bool:
-    return (
-        binding.router_id == zone.router_id
-        and binding.interface == zone.interface
-        and binding.internal_ip == zone.dedicated_ip
-    )
+    if binding.router_id != zone.router_id or binding.interface != zone.interface:
+        return False
+    if zone.dedicated_ip:
+        return binding.internal_ip == zone.dedicated_ip
+    return not binding.internal_ip
 
 
 def normalize_cloudflare_ttl(raw: int) -> int:
@@ -676,6 +786,10 @@ def should_bold_html_line(line: str) -> bool:
         for marker in (
             "中转同步测试",
             "更换请求已完成",
+            "换 IP 请求已受理",
+            "换 IP 请求结果暂不明确",
+            "换 IP 已完成",
+            "换 IP 暂时无法确认",
             "更换失败",
             "多次尝试后 IP 仍未变化",
         )
@@ -718,6 +832,8 @@ def safe_target_name(target_name: str, router_id: str = "", interface: str = "")
     value = (target_name or "").strip()
     if not value:
         return "目标机器"
+    if interface == API_INTERFACE:
+        return value
     if router_id and str(router_id) in value:
         return "目标机器"
     if interface and str(interface) in value:
@@ -879,6 +995,44 @@ class BotStore:
             ON relay_bindings (router_id, interface, enabled, id)
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_change_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL DEFAULT 0,
+                router_id TEXT NOT NULL,
+                interface TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                old_ip TEXT NOT NULL,
+                new_ip TEXT NOT NULL DEFAULT '',
+                requested_at INTEGER NOT NULL,
+                next_check_at INTEGER NOT NULL,
+                confirm_deadline INTEGER NOT NULL,
+                check_count INTEGER NOT NULL DEFAULT 0,
+                api_uses_left INTEGER,
+                next_allowed_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'confirming',
+                last_error TEXT NOT NULL DEFAULT '',
+                scheduled_job_id INTEGER,
+                finished_at INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_api_change_operations_due
+            ON api_change_operations (status, next_check_at)
+            """
+        )
+        self.conn.execute("DROP INDEX IF EXISTS idx_api_change_operations_active_target")
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_api_change_operations_active_target
+            ON api_change_operations (router_id, interface)
+            WHERE status IN ('requesting', 'confirming')
+            """
+        )
         self.conn.commit()
 
     def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
@@ -970,6 +1124,19 @@ class BotStore:
             (int(now), int(limit)),
         ).fetchall()
         return [self._scheduled_change_from_row(row) for row in rows]
+
+    def get_scheduled_change(self, job_id: int) -> ScheduledChange | None:
+        row = self.conn.execute(
+            """
+            SELECT id, chat_id, router_id, interface, target_name, run_at, created_at, status,
+                   schedule_type, interval_days, weekday, month_day, time_of_day, timezone_name,
+                   retry_count
+            FROM scheduled_changes
+            WHERE id = ?
+            """,
+            (int(job_id),),
+        ).fetchone()
+        return self._scheduled_change_from_row(row) if row else None
 
     def claim_scheduled_change(self, job_id: int) -> bool:
         cur = self.conn.execute(
@@ -1316,6 +1483,125 @@ class BotStore:
         )
         self.conn.commit()
 
+    def add_api_change_operation(
+        self,
+        chat_id: int,
+        message_id: int,
+        router_id: str,
+        interface: str,
+        target_name: str,
+        old_ip: str,
+        requested_at: int,
+        next_check_at: int,
+        confirm_deadline: int,
+        scheduled_job_id: int | None = None,
+    ) -> int:
+        try:
+            cur = self.conn.execute(
+                """
+                INSERT INTO api_change_operations
+                  (chat_id, message_id, router_id, interface, target_name, old_ip,
+                   requested_at, next_check_at, confirm_deadline, status, scheduled_job_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requesting', ?)
+                """,
+                (
+                    int(chat_id),
+                    int(message_id),
+                    str(router_id),
+                    str(interface),
+                    target_name.strip() or "目标机器",
+                    old_ip,
+                    int(requested_at),
+                    int(next_check_at),
+                    int(confirm_deadline),
+                    scheduled_job_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise IppanelError("这台机器已有正在确认的新 IP，请勿重复提交。") from exc
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def active_api_change(self, router_id: str, interface: str) -> ApiChangeOperation | None:
+        row = self.conn.execute(
+            """
+            SELECT * FROM api_change_operations
+            WHERE router_id = ? AND interface = ?
+              AND status IN ('requesting', 'confirming')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (str(router_id), str(interface)),
+        ).fetchone()
+        return self._api_change_operation_from_row(row) if row else None
+
+    def latest_api_cooldown(self, router_id: str, interface: str) -> int | None:
+        row = self.conn.execute(
+            """
+            SELECT next_allowed_at FROM api_change_operations
+            WHERE router_id = ? AND interface = ? AND next_allowed_at IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (str(router_id), str(interface)),
+        ).fetchone()
+        if not row or row["next_allowed_at"] is None:
+            return None
+        return int(row["next_allowed_at"])
+
+    def due_api_changes(self, now: int, limit: int = 5) -> list[ApiChangeOperation]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM api_change_operations
+            WHERE status IN ('requesting', 'confirming') AND next_check_at <= ?
+            ORDER BY next_check_at, id
+            LIMIT ?
+            """,
+            (int(now), int(limit)),
+        ).fetchall()
+        return [self._api_change_operation_from_row(row) for row in rows]
+
+    def accept_api_change_operation(
+        self,
+        operation_id: int,
+        api_uses_left: int | None,
+        next_allowed_at: int | None,
+        error: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE api_change_operations
+            SET status = 'confirming', api_uses_left = ?, next_allowed_at = ?, last_error = ?
+            WHERE id = ? AND status = 'requesting'
+            """,
+            (api_uses_left, next_allowed_at, error[:1000], int(operation_id)),
+        )
+        self.conn.commit()
+
+    def reschedule_api_change(
+        self, operation_id: int, next_check_at: int, check_count: int, error: str = ""
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE api_change_operations
+            SET next_check_at = ?, check_count = ?, last_error = ?
+            WHERE id = ? AND status IN ('requesting', 'confirming')
+            """,
+            (int(next_check_at), int(check_count), error[:1000], int(operation_id)),
+        )
+        self.conn.commit()
+
+    def finish_api_change(
+        self, operation_id: int, status: str, new_ip: str = "", error: str = ""
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE api_change_operations
+            SET status = ?, new_ip = ?, last_error = ?, finished_at = ?
+            WHERE id = ? AND status IN ('requesting', 'confirming')
+            """,
+            (status, new_ip, error[:1000], int(time.time()), int(operation_id)),
+        )
+        self.conn.commit()
+
     def _scheduled_change_from_row(self, row: sqlite3.Row) -> ScheduledChange:
         return ScheduledChange(
             id=int(row["id"]),
@@ -1369,6 +1655,35 @@ class BotStore:
             enabled=bool(parse_int(row["enabled"], 1)),
         )
 
+    def _api_change_operation_from_row(self, row: sqlite3.Row) -> ApiChangeOperation:
+        return ApiChangeOperation(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            message_id=parse_int(row["message_id"], 0),
+            router_id=str(row["router_id"]),
+            interface=str(row["interface"]),
+            target_name=str(row["target_name"] or "目标机器"),
+            old_ip=str(row["old_ip"] or ""),
+            new_ip=str(row["new_ip"] or ""),
+            requested_at=int(row["requested_at"]),
+            next_check_at=int(row["next_check_at"]),
+            confirm_deadline=int(row["confirm_deadline"]),
+            check_count=parse_int(row["check_count"], 0),
+            api_uses_left=(
+                int(row["api_uses_left"]) if row["api_uses_left"] is not None else None
+            ),
+            next_allowed_at=(
+                int(row["next_allowed_at"]) if row["next_allowed_at"] is not None else None
+            ),
+            status=str(row["status"]),
+            last_error=str(row["last_error"] or ""),
+            scheduled_job_id=(
+                int(row["scheduled_job_id"])
+                if row["scheduled_job_id"] is not None
+                else None
+            ),
+        )
+
     def close(self) -> None:
         self.conn.close()
 
@@ -1377,6 +1692,7 @@ class IppanelClient:
     def __init__(
         self, base_url: str, account: str, password: str, query_cache_seconds: int = 60
     ):
+        self.mode = "legacy"
         self.base_url = base_url.rstrip("/")
         self.account = account
         self.password = password
@@ -1542,6 +1858,165 @@ class IppanelClient:
             headers=response_headers,
             text=text,
         )
+
+
+def api_error_is_transient(message: str) -> bool:
+    normalized = str(message or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in ("內部錯誤", "内部错误", "internal error", "稍後再試", "稍后再试")
+    )
+
+
+def validate_public_ipv4(value: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise IppanelTransientError(f"API 返回了无效 IP：{text or '空值'}") from exc
+    if parsed.version != 4:
+        raise IppanelTransientError(f"API 返回的不是 IPv4：{text}")
+    return str(parsed)
+
+
+class IppanelApiClient:
+    def __init__(
+        self,
+        base_url: str,
+        targets: tuple[ApiTarget, ...],
+        query_cache_seconds: int = 60,
+    ):
+        self.mode = "api"
+        self.base_url = base_url.rstrip("/")
+        self.targets = targets
+        self.targets_by_id = {target.target_id: target for target in targets}
+        self.query_cache_seconds = max(0, query_cache_seconds)
+        self._query_all_cache: dict[str, Any] | None = None
+        self._query_all_cache_at = 0.0
+
+    def _target(self, router_id: str, interface: str) -> ApiTarget:
+        if str(interface) != API_INTERFACE:
+            raise IppanelError("API 模式机器标识无效，请重新打开机器列表。")
+        target = self.targets_by_id.get(str(router_id))
+        if target is None:
+            raise IppanelError("API 配置中没有找到这台机器，请检查 targets 文件。")
+        return target
+
+    def get_target_ip(self, router_id: str, interface: str) -> str:
+        target = self._target(router_id, interface)
+        payload = self._request_json(target, "/api/v1/getIP", timeout=30)
+        if not payload.get("ok"):
+            raise IppanelTransientError("查询 IP 未成功，请稍后再试。")
+        return validate_public_ipv4(str(payload.get("ip") or ""))
+
+    def target_label(self, router_id: str, interface: str) -> str:
+        return self._target(router_id, interface).label
+
+    def invalidate_cache(self) -> None:
+        self._query_all_cache = None
+        self._query_all_cache_at = 0.0
+
+    def query_all(self, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if (
+            not force
+            and self._query_all_cache is not None
+            and self.query_cache_seconds > 0
+            and now - self._query_all_cache_at <= self.query_cache_seconds
+        ):
+            return dict(self._query_all_cache)
+
+        results: dict[str, dict[str, str]] = {}
+        errors: dict[str, str] = {}
+        zone_items: list[dict[str, Any]] = []
+        for target in self.targets:
+            status = "ok"
+            status_msg = ""
+            current_ip = ""
+            try:
+                current_ip = self.get_target_ip(target.target_id, API_INTERFACE)
+            except IppanelError as exc:
+                status = "error"
+                status_msg = str(exc)
+                errors[target.target_id] = status_msg
+            results[target.target_id] = {API_INTERFACE: current_ip}
+            zone_items.append(
+                {
+                    "router_id": target.target_id,
+                    "interface": API_INTERFACE,
+                    "label": target.label,
+                    "dedicated_ip": "",
+                    "status": status,
+                    "status_msg": status_msg,
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "backend_mode": "api",
+            "results": results,
+            "errors": errors,
+            "zone_items": zone_items,
+        }
+        self._query_all_cache = dict(payload)
+        self._query_all_cache_at = now
+        return payload
+
+    def reconnect(self, router_id: str, interface: str) -> dict[str, Any]:
+        target = self._target(router_id, interface)
+        self.invalidate_cache()
+        payload = self._request_json(target, "/api/v1/changeIP/", timeout=30)
+        if not payload.get("ok"):
+            raise IppanelError(str(payload.get("error") or "API 未接受换 IP 请求。"))
+        return payload
+
+    def _request_json(self, target: ApiTarget, path: str, timeout: int) -> dict[str, Any]:
+        url = urllib.parse.urljoin(self.base_url + "/", path.lstrip("/"))
+        request = urllib.request.Request(
+            url,
+            data=b"",
+            headers={
+                "Authorization": f"Bearer {target.token}",
+                "Accept": "application/json",
+                "User-Agent": f"ippanelbot/{APP_VERSION}",
+            },
+            method="POST",
+        )
+        response_headers: dict[str, str] = {}
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                status = response.getcode()
+                response_headers = dict(response.headers.items())
+                charset = response.headers.get_content_charset() or "utf-8"
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            status = exc.code
+            response_headers = dict(exc.headers.items())
+            charset = exc.headers.get_content_charset() or "utf-8"
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            raise IppanelTransientError(f"API 网络错误：{reason}") from exc
+
+        text = raw.decode(charset, errors="replace")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            snippet = text[:200].replace("\n", " ")
+            raise IppanelTransientError(f"API 返回了非 JSON 内容：{snippet}") from exc
+        if not isinstance(payload, dict):
+            raise IppanelTransientError("API 返回了无法识别的 JSON。")
+
+        error_message = str(payload.get("error") or "").strip()
+        if status == 429:
+            raise IppanelRateLimited(path, retry_after_seconds(response_headers))
+        if status >= 500:
+            raise IppanelTransientError(error_message or f"API HTTP {status}")
+        if status >= 400 or error_message:
+            message = error_message or f"API HTTP {status}"
+            if api_error_is_transient(message):
+                raise IppanelTransientError(message)
+            raise IppanelError(message)
+        return payload
 
 
 class CloudflareClient:
@@ -1925,8 +2400,13 @@ def parse_zones(payload: dict[str, Any]) -> list[ZoneItem]:
             status_msg = str(item.get("status_msg") or "").strip()
             ip_map = get_key(results, router_id) or {}
             current_ip = str(get_key(ip_map, interface) or "").strip()
-            if get_key(errors, router_id):
-                current_ip = "查询失败"
+            panel_error = str(get_key(errors, router_id) or "").strip()
+            if panel_error:
+                current_ip = ""
+                if status == "ok":
+                    status = "error"
+                if not status_msg:
+                    status_msg = panel_error
             zones.append(
                 ZoneItem(
                     router_id=router_id,
@@ -1969,6 +2449,8 @@ def find_zone(zones: list[ZoneItem], router_id: str, interface: str) -> ZoneItem
 
 
 def quota_text(payload: dict[str, Any]) -> str:
+    if payload.get("backend_mode") == "api":
+        return "API 模式：可用次数和换 IP CD 会在提交成功后返回"
     used = payload.get("daily_used")
     limit = payload.get("daily_limit")
     if used is None and limit is None:
@@ -1986,6 +2468,8 @@ def status_label(zone: ZoneItem) -> str:
         return "可更换"
     if zone.status in ("query_only", "blacklisted"):
         return "仅查询"
+    if zone.status == "error":
+        return zone.status_msg or "查询失败"
     if zone.status_msg:
         return zone.status_msg
     return zone.status or "未知"
@@ -2086,6 +2570,53 @@ def change_retry_reason(reconnect_data: dict[str, Any]) -> str:
     return "更换未成功"
 
 
+def api_confirmation_delay(check_count: int, poll_interval: int) -> int:
+    index = max(0, int(check_count))
+    if index < len(API_CONFIRM_BACKOFF_SECONDS):
+        return API_CONFIRM_BACKOFF_SECONDS[index]
+    return max(5, int(poll_interval))
+
+
+def format_api_change_accepted(
+    target_name: str,
+    old_ip: str,
+    uses_left: int | None,
+    next_allowed_at: int | None,
+    tz,
+    timezone_name: str,
+) -> str:
+    lines = [tg_bold(f"{target_name} 换 IP 请求已受理"), f"旧 IP：{old_ip}"]
+    if uses_left is not None:
+        lines.append(f"API 可用次数：{uses_left}")
+    if next_allowed_at:
+        lines.append(
+            f"下次允许换 IP：{format_run_time(next_allowed_at, tz, timezone_name)}"
+        )
+    lines.extend(["", "正在后台等待并确认新 IP，不会重复提交换 IP。"])
+    return "\n".join(lines)
+
+
+def format_api_change_confirmed(
+    operation: ApiChangeOperation, new_ip: str, tz, timezone_name: str
+) -> str:
+    elapsed = max(0, int(time.time()) - operation.requested_at)
+    lines = [
+        tg_bold(f"{operation.target_name} 换 IP 已完成"),
+        f"旧 IP：{operation.old_ip}",
+        f"新 IP：{new_ip}",
+        purity_link_line(new_ip),
+        f"确认耗时：{elapsed} 秒",
+    ]
+    if operation.api_uses_left is not None:
+        lines.append(f"API 可用次数：{operation.api_uses_left}")
+    if operation.next_allowed_at:
+        lines.append(
+            "下次允许换 IP："
+            f"{format_run_time(operation.next_allowed_at, tz, timezone_name)}"
+        )
+    return "\n".join(lines)
+
+
 def callback_data(action: str, router_id: str, interface: str) -> str:
     return "|".join(
         [
@@ -2136,11 +2667,17 @@ class BotApp:
         self.config = config
         self.telegram = TelegramApi(config.telegram_bot_token)
         self.store = BotStore(config.db_path)
-        self.panel = IppanelClient(
-            config.ippanel_base_url,
-            config.ippanel_account,
-            config.ippanel_password,
-            config.query_cache_seconds,
+        self.panel = make_panel_client(config)
+        self.api_panel = (
+            self.panel
+            if isinstance(self.panel, IppanelApiClient)
+            else IppanelApiClient(
+                config.ippanel_base_url,
+                config.ippanel_api_targets,
+                query_cache_seconds=0,
+            )
+            if config.ippanel_api_targets
+            else None
         )
         self.stop_requested = False
         self.changing: set[tuple[str, str]] = set()
@@ -2154,12 +2691,15 @@ class BotApp:
             self.cloudflare = CloudflareClient(config.cloudflare_api_token, config.cloudflare_zone_id)
 
     def run(self) -> None:
-        logging.info("Starting ippanelbot %s", APP_VERSION)
+        logging.info(
+            "Starting ippanelbot %s in %s mode", APP_VERSION, self.config.ippanel_mode
+        )
         self.configure_bot_commands()
         self.send_startup_notice()
         offset: int | None = None
         while not self.stop_requested:
             try:
+                self.run_due_api_change_confirmations()
                 self.run_due_scheduled_changes()
                 updates = self.telegram.get_updates(
                     offset=offset, timeout=self.config.poll_timeout_seconds
@@ -2167,6 +2707,7 @@ class BotApp:
                 for update in updates:
                     offset = max(offset or 0, int(update["update_id"]) + 1)
                     self.handle_update(update)
+                self.run_due_api_change_confirmations()
                 self.run_due_scheduled_changes()
             except KeyboardInterrupt:
                 self.stop_requested = True
@@ -2351,9 +2892,11 @@ class BotApp:
             self.telegram.answer_callback_query(callback_id, "未知操作，请重新发送 /change")
 
     def help_text(self) -> str:
+        mode_label = "API Token" if self.config.ippanel_mode == "api" else "账号登录"
         return "\n".join(
             [
                 "IPPanelBot",
+                f"当前模式：{mode_label}",
                 "",
                 "/ip - 查询当前机器和 IP",
                 "/change - 选择机器，立即/延时/计划任务更换 IP",
@@ -2364,7 +2907,8 @@ class BotApp:
         )
 
     def send_start_panel(self, chat_id: int) -> None:
-        caption = "BoilのIP管理Panel\n请选择下方按钮操作。"
+        mode_label = "API Token" if self.config.ippanel_mode == "api" else "账号登录"
+        caption = f"BoilのIP管理Panel\n当前模式：{mode_label}\n请选择下方按钮操作。"
         image_path = self.config.panel_image_path
         if image_path.exists():
             if self.panel_photo_file_id:
@@ -2405,8 +2949,10 @@ class BotApp:
         )
 
     def send_help_panel(self, chat_id: int) -> None:
+        mode_label = "API Token" if self.config.ippanel_mode == "api" else "账号登录"
         lines = [
             "可用操作",
+            f"当前模式：{mode_label}",
             "查询 IP：查看当前机器和公网 IP",
             "更换 IP：立即、延时或计划任务更换",
             "任务列表：查看和取消未执行任务",
@@ -2705,7 +3251,7 @@ class BotApp:
                     else:
                         lines.append("   测试同步：面板没有返回当前公网 IP")
                 elif all_bindings:
-                    lines.append("   绑定结果：绑定失效，内网 IP 不匹配")
+                    lines.append("   绑定结果：绑定失效，机器标识不匹配")
                 else:
                     lines.append("   绑定结果：未绑定")
                 lines.append("")
@@ -2763,7 +3309,7 @@ class BotApp:
             if not bindings:
                 lines.append("绑定结果：未绑定")
             elif not matched:
-                lines.append("绑定结果：绑定失效，内网 IP 不匹配")
+                lines.append("绑定结果：绑定失效，机器标识不匹配")
             elif not zone.current_ip:
                 lines.append("测试结果：失败，面板没有返回当前公网 IP。")
             else:
@@ -3135,6 +3681,78 @@ class BotApp:
         except IppanelError as exc:
             self.telegram.edit_message_text(chat_id, message_id, f"面板请求失败：{exc}")
 
+    def begin_api_change(
+        self,
+        chat_id: int,
+        message_id: int,
+        router_id: str,
+        interface: str,
+        scheduled_job_id: int | None = None,
+    ) -> str:
+        if not isinstance(self.panel, IppanelApiClient):
+            raise IppanelError("当前不是 API 模式。")
+        if self.store.active_api_change(router_id, interface):
+            raise IppanelError("这台机器已有正在确认的新 IP，请勿重复提交。")
+        next_allowed_at = self.store.latest_api_cooldown(router_id, interface)
+        if next_allowed_at and next_allowed_at > int(time.time()):
+            raise IppanelError(
+                "仍在换 IP CD，下一次允许时间："
+                f"{format_run_time(next_allowed_at, self.timezone, self.config.timezone_name)}"
+            )
+
+        old_ip = self.panel.get_target_ip(router_id, interface)
+        target_name = self.panel.target_label(router_id, interface)
+        now = int(time.time())
+        operation_id = self.store.add_api_change_operation(
+            chat_id=chat_id,
+            message_id=message_id,
+            router_id=router_id,
+            interface=interface,
+            target_name=target_name,
+            old_ip=old_ip,
+            requested_at=now,
+            next_check_at=now + self.config.api_change_initial_delay_seconds,
+            confirm_deadline=now + self.config.api_change_confirm_timeout_seconds,
+            scheduled_job_id=scheduled_job_id,
+        )
+
+        try:
+            response = self.panel.reconnect(router_id, interface)
+        except IppanelTransientError as exc:
+            logging.warning(
+                "API change response was inconclusive for %s/%s: %s",
+                router_id,
+                interface,
+                exc,
+            )
+            self.store.accept_api_change_operation(operation_id, None, None, str(exc))
+            return "\n".join(
+                [
+                    tg_bold(f"{target_name} 换 IP 请求结果暂不明确"),
+                    f"旧 IP：{old_ip}",
+                    f"API 返回：{exc}",
+                    "",
+                    "Bot 将只查询 IP 来确认结果，不会重复提交换 IP。",
+                ]
+            )
+        except Exception as exc:
+            self.store.finish_api_change(operation_id, "request_failed", error=str(exc))
+            raise
+
+        uses_left = optional_int(response.get("uses_left"))
+        next_allowed_at = optional_int(response.get("next_allowed_at"))
+        self.store.accept_api_change_operation(
+            operation_id, uses_left, next_allowed_at
+        )
+        return format_api_change_accepted(
+            target_name,
+            old_ip,
+            uses_left,
+            next_allowed_at,
+            self.timezone,
+            self.config.timezone_name,
+        )
+
     def run_change(
         self,
         router_id: str,
@@ -3198,6 +3816,18 @@ class BotApp:
 
     def perform_change(self, chat_id: int, message_id: int, router_id: str, interface: str) -> None:
         try:
+            if self.config.ippanel_mode == "api":
+                self.telegram.edit_message_text(
+                    chat_id, message_id, "正在查询旧 IP 并提交一次换 IP 请求…"
+                )
+                result = self.begin_api_change(
+                    chat_id, message_id, router_id, interface
+                )
+                self.telegram.edit_message_text(
+                    chat_id, message_id, telegram_html(result), parse_mode="HTML"
+                )
+                return
+
             def progress(text: str) -> None:
                 self.telegram.edit_message_text(chat_id, message_id, text)
 
@@ -3234,6 +3864,20 @@ class BotApp:
             logging.exception("DDNS sync after change failed")
             return f"DDNS 同步失败：{exc}"
 
+    def sync_ddns_after_confirmed(
+        self, chat_id: int, router_id: str, interface: str, new_ip: str
+    ) -> str:
+        if not (self.config.ddns_enabled and self.config.ddns_sync_after_change):
+            return ""
+        binding = self.store.get_ddns_binding(chat_id, router_id, interface)
+        if not binding:
+            return ""
+        try:
+            return self.sync_ddns_binding(binding, new_ip)
+        except Exception as exc:
+            logging.exception("DDNS sync after API change failed")
+            return f"DDNS 同步失败：{exc}"
+
     def sync_relay_after_change(self, router_id: str, interface: str) -> str:
         if not (self.config.relay_sync_enabled and self.config.relay_sync_after_change):
             return ""
@@ -3257,14 +3901,14 @@ class BotApp:
                 return f"中转同步失败：无法确认当前 VPS 状态：{exc}"
         if not zone:
             return "中转同步失败：面板里没有找到已绑定的 VPS。"
-        if not zone.dedicated_ip:
+        if not zone.dedicated_ip and zone.interface != API_INTERFACE:
             return "中转同步失败：面板没有返回内网 IP，无法校验绑定。"
 
         matched = [
             binding for binding in bindings if relay_binding_matches_zone(binding, zone)
         ]
         if not matched:
-            return "中转同步跳过：绑定指纹不匹配，请在 VPS 上重新运行 sudo boil relay。"
+            return "中转同步跳过：机器标识不匹配，请在 VPS 上重新运行 sudo boil relay。"
 
         new_ip = (
             str(reconnect_data.get("new_ip") or "").strip()
@@ -3594,6 +4238,172 @@ class BotApp:
         else:
             self.telegram.send_message(chat_id, f"没有找到可删除的 DDNS 绑定 {display_number}。")
 
+    def finish_api_scheduled_job(
+        self, operation: ApiChangeOperation, result: str, succeeded: bool
+    ) -> None:
+        if operation.scheduled_job_id is None:
+            return
+        job = self.store.get_scheduled_change(operation.scheduled_job_id)
+        if not job:
+            logging.warning(
+                "API confirmation references missing scheduled job %s",
+                operation.scheduled_job_id,
+            )
+            return
+
+        next_run_at = next_recurring_run_at(job, int(time.time()))
+        error = "" if succeeded else operation.last_error or result
+        if next_run_at:
+            self.store.reschedule_scheduled_change(job.id, next_run_at, error)
+            job_tz_name = job.timezone_name or self.config.timezone_name
+            job_tz = load_timezone(job_tz_name)
+            result = (
+                f"{result}\n\n"
+                f"下次执行：{format_run_time(next_run_at, job_tz, job_tz_name)}"
+            )
+        else:
+            self.store.finish_scheduled_change(
+                job.id, "done" if succeeded else "failed", error
+            )
+        self.telegram.send_message(
+            operation.chat_id,
+            telegram_html(f"计划任务\n{result}"),
+            parse_mode="HTML",
+        )
+
+    def notify_api_change(self, operation: ApiChangeOperation, result: str) -> None:
+        if operation.scheduled_job_id is not None:
+            return
+        self.send_or_edit(
+            operation.chat_id,
+            operation.message_id or None,
+            result,
+        )
+
+    def complete_api_change(self, operation: ApiChangeOperation, new_ip: str) -> None:
+        self.store.finish_api_change(operation.id, "confirmed", new_ip=new_ip)
+        if self.api_panel:
+            self.api_panel.invalidate_cache()
+        zone_before = ZoneItem(
+            router_id=operation.router_id,
+            interface=operation.interface,
+            label=operation.target_name,
+            dedicated_ip="",
+            current_ip=operation.old_ip,
+            status="ok",
+            status_msg="",
+        )
+        zone_after = ZoneItem(
+            router_id=operation.router_id,
+            interface=operation.interface,
+            label=operation.target_name,
+            dedicated_ip="",
+            current_ip=new_ip,
+            status="ok",
+            status_msg="",
+        )
+        key = (operation.router_id, operation.interface)
+        self.last_change_context[key] = ChangeContext(
+            zone_before=zone_before,
+            reconnect_data={"old_ip": operation.old_ip, "new_ip": new_ip},
+            payload_after=None,
+            zone_after=zone_after,
+        )
+
+        result = format_api_change_confirmed(
+            operation, new_ip, self.timezone, self.config.timezone_name
+        )
+        ddns_result = self.sync_ddns_after_confirmed(
+            operation.chat_id,
+            operation.router_id,
+            operation.interface,
+            new_ip,
+        )
+        if ddns_result:
+            result = f"{result}\n\n{ddns_result}"
+        relay_result = self.sync_relay_after_change(
+            operation.router_id, operation.interface
+        )
+        if relay_result:
+            result = f"{result}\n\n{relay_result}"
+
+        self.notify_api_change(operation, result)
+        self.finish_api_scheduled_job(operation, result, True)
+
+    def timeout_api_change(self, operation: ApiChangeOperation, error: str) -> None:
+        self.store.finish_api_change(
+            operation.id, "confirmation_timeout", error=error
+        )
+        operation.last_error = error
+        result = "\n".join(
+            [
+                tg_bold(f"{operation.target_name} 换 IP 暂时无法确认"),
+                f"换 IP 前：{operation.old_ip}",
+                f"最近查询：{error}",
+                "",
+                "Bot 没有重复提交换 IP。请稍后使用 /ip 查询。",
+            ]
+        )
+        self.notify_api_change(operation, result)
+        self.finish_api_scheduled_job(operation, result, False)
+
+    def run_due_api_change_confirmations(self) -> None:
+        operations = self.store.due_api_changes(int(time.time()), limit=5)
+        for operation in operations:
+            try:
+                if not self.api_panel:
+                    error = "API targets 配置不可用，无法继续确认。"
+                    if int(time.time()) >= operation.confirm_deadline:
+                        self.timeout_api_change(operation, error)
+                    else:
+                        next_check = (
+                            int(time.time())
+                            + self.config.api_change_poll_interval_seconds
+                        )
+                        self.store.reschedule_api_change(
+                            operation.id,
+                            next_check,
+                            operation.check_count + 1,
+                            error,
+                        )
+                    continue
+
+                try:
+                    current_ip = self.api_panel.get_target_ip(
+                        operation.router_id, operation.interface
+                    )
+                    error = ""
+                except IppanelError as exc:
+                    current_ip = ""
+                    error = str(exc)
+
+                now = int(time.time())
+                if current_ip and current_ip != operation.old_ip:
+                    self.complete_api_change(operation, current_ip)
+                    continue
+
+                if not error:
+                    error = f"当前仍为旧 IP：{operation.old_ip}"
+                if now >= operation.confirm_deadline:
+                    self.timeout_api_change(operation, error)
+                    continue
+
+                check_count = operation.check_count + 1
+                delay = api_confirmation_delay(
+                    check_count, self.config.api_change_poll_interval_seconds
+                )
+                self.store.reschedule_api_change(
+                    operation.id, now + delay, check_count, error
+                )
+            except TelegramError as exc:
+                logging.warning(
+                    "Could not notify API change operation %s: %s", operation.id, exc
+                )
+            except Exception:
+                logging.exception(
+                    "API change confirmation failed for operation %s", operation.id
+                )
+
     def run_due_scheduled_changes(self) -> None:
         due_jobs = self.store.due_scheduled_changes(int(time.time()), limit=3)
         for job in due_jobs:
@@ -3607,6 +4417,21 @@ class BotApp:
                     job.chat_id,
                     f"计划任务到点，正在更换 {safe_target_name(job.target_name, job.router_id, job.interface)} 的 IP…",
                 )
+
+                if self.config.ippanel_mode == "api":
+                    result = self.begin_api_change(
+                        job.chat_id,
+                        0,
+                        job.router_id,
+                        job.interface,
+                        scheduled_job_id=job.id,
+                    )
+                    self.telegram.send_message(
+                        job.chat_id,
+                        telegram_html(f"计划任务\n{result}"),
+                        parse_mode="HTML",
+                    )
+                    continue
 
                 def progress(text: str) -> None:
                     self.telegram.send_message(job.chat_id, f"计划任务\n{text}")
@@ -3710,7 +4535,13 @@ def configure_logging(level: str) -> None:
     )
 
 
-def make_panel_client(config: Config) -> IppanelClient:
+def make_panel_client(config: Config) -> IppanelClient | IppanelApiClient:
+    if config.ippanel_mode == "api":
+        return IppanelApiClient(
+            config.ippanel_base_url,
+            config.ippanel_api_targets,
+            config.query_cache_seconds,
+        )
     return IppanelClient(
         config.ippanel_base_url,
         config.ippanel_account,
@@ -3811,7 +4642,9 @@ def cli_configure_relay(config: Config) -> int:
     cli_print_vps_list(zones)
     choice = prompt_cli_int("请输入序号: ", 1, len(zones))
     zone = zones[choice - 1]
-    if not zone.dedicated_ip:
+    if not zone.dedicated_ip and zone.interface == API_INTERFACE:
+        print("API 模式将使用本地机器 ID 校验绑定。")
+    elif not zone.dedicated_ip:
         print("这台 VPS 没有返回内网 IP，无法创建安全绑定。")
         return 1
 

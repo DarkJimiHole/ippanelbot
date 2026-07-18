@@ -8,6 +8,7 @@ SERVICE_GROUP="ippanelbot"
 APP_DIR="/opt/ippanelbot"
 DATA_DIR="/var/lib/ippanelbot"
 ENV_FILE="/etc/ippanelbot.env"
+API_TARGETS_FILE="/etc/ippanelbot-api-targets.json"
 SOURCE_FILE="/etc/ippanelbot.source"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CTL_PATH="/usr/local/bin/boil"
@@ -380,6 +381,77 @@ prompt_ttl() {
   done
 }
 
+prompt_panel_mode() {
+  local __var="$1"
+  local current="${2:-legacy}"
+  local default_choice=1 choice
+  [ "$current" = "api" ] && default_choice=2
+  while true; do
+    printf "\n面板接入模式：\n"
+    printf "  1) legacy - 原账号密码登录模式\n"
+    printf "  2) api    - Bearer Token API 模式\n"
+    read -r -p "请选择 [${default_choice}]: " choice
+    choice="${choice:-$default_choice}"
+    case "$choice" in
+      1|legacy) printf -v "$__var" "%s" "legacy"; return 0 ;;
+      2|api) printf -v "$__var" "%s" "api"; return 0 ;;
+      *) warn "请选择 1 或 2。" ;;
+    esac
+  done
+}
+
+configure_api_targets_interactive() {
+  local target_file="$1"
+  local count rows_file json_file target_id target_name api_token index
+  if [ -f "$target_file" ] && ! confirm "重新配置 API 机器和 Token？" n; then
+    ok "已保留 API targets：${target_file}"
+    return 0
+  fi
+
+  prompt_int count "API 机器数量" 1 1 50
+  rows_file="$(mktemp)"
+  json_file="$(mktemp)"
+  chmod 600 "$rows_file" "$json_file"
+  for ((index = 1; index <= count; index++)); do
+    printf "\n配置第 %s/%s 台 API 机器。\n" "$index" "$count"
+    while true; do
+      prompt_value target_id "机器 ID（字母、数字、_、-，最多32字符）" "" 1 0
+      if [[ "$target_id" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
+        break
+      fi
+      warn "机器 ID 格式不正确。"
+    done
+    prompt_value target_name "机器显示名称" "$target_id" 1 0
+    prompt_value api_token "API Token" "" 1 1
+    if [[ "$target_name" == *$'\t'* || "$api_token" == *$'\t'* ]]; then
+      rm -f "$rows_file" "$json_file"
+      die "机器名称和 Token 不能包含制表符。"
+    fi
+    printf "%s\t%s\t%s\n" "$target_id" "$target_name" "$api_token" >>"$rows_file"
+  done
+
+  if ! /usr/bin/python3 -c '
+import csv, json, pathlib, sys
+rows = []
+seen = set()
+with open(sys.argv[1], encoding="utf-8", newline="") as handle:
+    for target_id, name, token in csv.reader(handle, delimiter="\t"):
+        if target_id in seen:
+            raise SystemExit(f"机器 ID 重复：{target_id}")
+        seen.add(target_id)
+        rows.append({"id": target_id, "name": name, "token": token})
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+' "$rows_file" "$json_file"; then
+    rm -f "$rows_file" "$json_file"
+    die "API targets 配置生成失败。"
+  fi
+  install -m 640 -o root -g "$SERVICE_GROUP" "$json_file" "$target_file"
+  rm -f "$rows_file" "$json_file"
+  ok "API targets 已保存：${target_file}"
+}
+
 detect_timezone() {
   local tz
   tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
@@ -399,7 +471,8 @@ validate_timezone() {
 }
 
 write_config_interactive() {
-  local token chat_ids base_url account password db_path
+  local token chat_ids panel_mode base_url account password api_targets_file db_path
+  local api_initial_delay api_poll_interval api_confirm_timeout
   local post_delay query_cache max_attempts retry_delay timezone poll_timeout panel_image log_level
   local ddns_enabled cloudflare_api_token cloudflare_zone_id ddns_ttl ddns_sync_after_change
   local relay_sync_enabled relay_sync_after_change
@@ -411,27 +484,52 @@ write_config_interactive() {
   info "请输入 Bot 和面板配置。"
   prompt_value token "Telegram Bot Token" "$(env_value TELEGRAM_BOT_TOKEN)" 1 0
   prompt_value chat_ids "允许使用的 Telegram chat id，多个用英文逗号分隔" "$(env_value TELEGRAM_ALLOWED_CHAT_IDS)" 1 0
+  panel_mode="$(env_value IPPANEL_MODE || true)"
+  [ -n "$panel_mode" ] || panel_mode="legacy"
+  prompt_panel_mode panel_mode "$panel_mode"
   base_url="$(env_value IPPANEL_BASE_URL || true)"
   [ -n "$base_url" ] || base_url="https://ippanel.boil.network"
   prompt_value base_url "IP 面板地址" "$base_url" 1 0
-  prompt_value account "BoilCloud 面板账号" "$(env_value IPPANEL_ACCOUNT)" 1 0
-  prompt_value password "BoilCloud 面板密码" "$(env_value IPPANEL_PASSWORD)" 1 1
+  account="$(env_value IPPANEL_ACCOUNT)"
+  password="$(env_value IPPANEL_PASSWORD)"
+  api_targets_file="$(env_value IPPANEL_API_TARGETS_FILE || true)"
+  [ -n "$api_targets_file" ] || api_targets_file="$API_TARGETS_FILE"
+  if [ "$panel_mode" = "legacy" ]; then
+    prompt_value account "BoilCloud 面板账号" "$account" 1 0
+    prompt_value password "BoilCloud 面板密码" "$password" 1 1
+  else
+    configure_api_targets_interactive "$api_targets_file"
+  fi
+
+  api_initial_delay="$(env_value API_CHANGE_INITIAL_DELAY_SECONDS || true)"
+  [ -n "$api_initial_delay" ] || api_initial_delay=5
+  api_poll_interval="$(env_value API_CHANGE_POLL_INTERVAL_SECONDS || true)"
+  [ -n "$api_poll_interval" ] || api_poll_interval=30
+  api_confirm_timeout="$(env_value API_CHANGE_CONFIRM_TIMEOUT_SECONDS || true)"
+  [ -n "$api_confirm_timeout" ] || api_confirm_timeout=300
+  if [ "$panel_mode" = "api" ]; then
+    prompt_int api_initial_delay "API 换 IP 后首次查询等待秒数" "$api_initial_delay" 1 300
+    prompt_int api_poll_interval "API 新 IP 确认轮询秒数" "$api_poll_interval" 5 300
+    prompt_int api_confirm_timeout "API 新 IP 最长确认秒数" "$api_confirm_timeout" 30 3600
+  fi
 
   db_path="$(env_value DB_PATH)"
   [ -n "$db_path" ] || db_path="${DATA_DIR}/ippanel_bot.sqlite3"
 
   post_delay="$(env_value POST_CHANGE_QUERY_DELAY_SECONDS || true)"
   [ -n "$post_delay" ] || post_delay=5
-  prompt_int post_delay "更换后等待查询秒数" "$post_delay" 1 60
   query_cache="$(env_value QUERY_CACHE_SECONDS || true)"
   [ -n "$query_cache" ] || query_cache=60
   prompt_int query_cache "查询缓存秒数" "$query_cache" 0 300
   max_attempts="$(env_value CHANGE_MAX_ATTEMPTS || true)"
   [ -n "$max_attempts" ] || max_attempts=5
-  prompt_int max_attempts "更换失败重试次数" "$max_attempts" 1 20
   retry_delay="$(env_value CHANGE_RETRY_DELAY_SECONDS || true)"
   [ -n "$retry_delay" ] || retry_delay=60
-  prompt_int retry_delay "更换失败重试间隔秒数" "$retry_delay" 1 3600
+  if [ "$panel_mode" = "legacy" ]; then
+    prompt_int post_delay "更换后等待查询秒数" "$post_delay" 1 60
+    prompt_int max_attempts "更换失败重试次数" "$max_attempts" 1 20
+    prompt_int retry_delay "更换失败重试间隔秒数" "$retry_delay" 1 3600
+  fi
 
   while true; do
     prompt_value timezone "计划任务时区" "$old_timezone" 1 0
@@ -487,9 +585,14 @@ write_config_interactive() {
     printf "TELEGRAM_BOT_TOKEN=%s\n" "$(env_quote "$token")"
     printf "TELEGRAM_ALLOWED_CHAT_IDS=%s\n" "$(env_quote "$chat_ids")"
     printf "\n"
+    printf "IPPANEL_MODE=%s\n" "$(env_quote "$panel_mode")"
     printf "IPPANEL_BASE_URL=%s\n" "$(env_quote "$base_url")"
     printf "IPPANEL_ACCOUNT=%s\n" "$(env_quote "$account")"
     printf "IPPANEL_PASSWORD=%s\n" "$(env_quote "$password")"
+    printf "IPPANEL_API_TARGETS_FILE=%s\n" "$(env_quote "$api_targets_file")"
+    printf "API_CHANGE_INITIAL_DELAY_SECONDS=%s\n" "$(env_quote "$api_initial_delay")"
+    printf "API_CHANGE_POLL_INTERVAL_SECONDS=%s\n" "$(env_quote "$api_poll_interval")"
+    printf "API_CHANGE_CONFIRM_TIMEOUT_SECONDS=%s\n" "$(env_quote "$api_confirm_timeout")"
     printf "\n"
     printf "DB_PATH=%s\n" "$(env_quote "$db_path")"
     printf "POST_CHANGE_QUERY_DELAY_SECONDS=%s\n" "$(env_quote "$post_delay")"
@@ -539,7 +642,8 @@ is_installed() {
 
 has_managed_files() {
   [ -e "$SERVICE_FILE" ] || [ -d "$APP_DIR" ] || [ -d "$DATA_DIR" ] || \
-    [ -f "$ENV_FILE" ] || [ -f "$SOURCE_FILE" ] || [ -e "$CTL_PATH" ] || \
+    [ -f "$ENV_FILE" ] || [ -f "$API_TARGETS_FILE" ] || [ -f "$SOURCE_FILE" ] || \
+    [ -e "$CTL_PATH" ] || \
     id "$SERVICE_USER" >/dev/null 2>&1 || getent group "$SERVICE_GROUP" >/dev/null 2>&1
 }
 
@@ -666,13 +770,14 @@ run_uninstall() {
     return 0
   fi
   warn "即将卸载 ${APP_NAME}，包括服务、配置、程序文件和 SQLite 数据。"
-  warn "只会删除这些路径：${APP_DIR}、${DATA_DIR}、${ENV_FILE}、${SOURCE_FILE}、${SERVICE_FILE}、${CTL_PATH}。"
+  warn "只会删除这些路径：${APP_DIR}、${DATA_DIR}、${ENV_FILE}、${API_TARGETS_FILE}、${SOURCE_FILE}、${SERVICE_FILE}、${CTL_PATH}。"
 
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
   safe_remove_file "$SERVICE_FILE" "$SERVICE_FILE"
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
   safe_remove_file "$ENV_FILE" "$ENV_FILE"
+  safe_remove_file "$API_TARGETS_FILE" "$API_TARGETS_FILE"
   safe_remove_file "$SOURCE_FILE" "$SOURCE_FILE"
   safe_remove_dir "$APP_DIR" "$APP_DIR"
   safe_remove_dir "$DATA_DIR" "$DATA_DIR"
