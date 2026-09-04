@@ -238,8 +238,8 @@ install_manager() {
     if [ "$current" != "$target" ]; then
       install -m 755 -o root -g root "$src" "$CTL_PATH"
       ok "管理命令已安装：${CTL_PATH}"
+      return 0
     fi
-    return 0
   fi
 
   copy_or_download "ippanelbot.sh" "$CTL_PATH" 755
