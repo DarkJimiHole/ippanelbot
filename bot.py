@@ -34,8 +34,11 @@ PAGE_SIZE = 3
 PANEL_TRANSIENT_HTTP_STATUS = {502, 503, 504}
 PANEL_TRANSIENT_RETRY_DELAYS = (5, 15)
 API_INTERFACE = "api"
+LEGACY_INTERFACE = "line"
 API_TARGET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 API_CONFIRM_BACKOFF_SECONDS = (5, 10, 15, 30)
+V2_JOB_POLL_SECONDS = 2
+V2_JOB_TIMEOUT_SECONDS = 300
 
 
 class ConfigError(Exception):
@@ -1280,6 +1283,79 @@ class BotStore:
         ).fetchone()
         return self._ddns_binding_from_row(row) if row else None
 
+    def get_ddns_binding_for_zone(
+        self,
+        chat_id: int,
+        router_id: str,
+        interface: str,
+        target_name: str = "",
+        previous_ip: str = "",
+    ) -> DdnsBinding | None:
+        binding = self.get_ddns_binding(chat_id, router_id, interface)
+        if binding:
+            return binding
+
+        candidates = self.conn.execute(
+            """
+            SELECT id, chat_id, router_id, interface, target_name, hostname, record_id,
+                   ttl, proxied, last_ip, last_update_at, enabled
+            FROM ddns_bindings
+            WHERE chat_id = ? AND enabled = 1
+            ORDER BY id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+        target_name = target_name.strip()
+        previous_ip = previous_ip.strip()
+        matches = []
+        if target_name:
+            matches = [
+                row
+                for row in candidates
+                if str(row["target_name"] or "").strip() == target_name
+            ]
+        if len(matches) != 1 and previous_ip:
+            ip_matches = [
+                row
+                for row in candidates
+                if str(row["last_ip"] or "").strip() == previous_ip
+            ]
+            if len(ip_matches) == 1:
+                matches = ip_matches
+        if len(matches) != 1:
+            return None
+
+        row = matches[0]
+        try:
+            self.conn.execute(
+                """
+                UPDATE ddns_bindings
+                SET router_id = ?, interface = ?, target_name = ?, updated_at = ?
+                WHERE id = ? AND chat_id = ? AND enabled = 1
+                """,
+                (
+                    str(router_id),
+                    str(interface),
+                    target_name or str(row["target_name"] or "目标机器"),
+                    int(time.time()),
+                    int(row["id"]),
+                    int(chat_id),
+                ),
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return None
+        logging.info(
+            "Migrated DDNS binding %s from %s/%s to %s/%s",
+            row["id"],
+            row["router_id"],
+            row["interface"],
+            router_id,
+            interface,
+        )
+        return self.get_ddns_binding(chat_id, router_id, interface)
+
     def update_ddns_result(
         self, binding_id: int, record_id: str, ip: str, ttl: int = 1, proxied: bool = False
     ) -> None:
@@ -1414,6 +1490,80 @@ class BotStore:
             (str(router_id), str(interface)),
         ).fetchall()
         return [self._relay_binding_from_row(row) for row in rows]
+
+    def migrate_relay_bindings_for_zone(
+        self,
+        router_id: str,
+        interface: str,
+        target_name: str,
+        internal_ip: str = "",
+        previous_ip: str = "",
+    ) -> list[RelayBinding]:
+        existing = self.list_relay_bindings_for_zone(router_id, interface)
+        if existing or not target_name.strip():
+            return existing
+
+        rows = self.conn.execute(
+            """
+            SELECT id, internal_ip, last_ip FROM relay_bindings
+            WHERE target_name = ? AND enabled = 1
+            ORDER BY id
+            """,
+            (target_name.strip(),),
+        ).fetchall()
+        if not rows:
+            return []
+
+        if internal_ip.strip():
+            rows = [
+                row
+                for row in rows
+                if str(row["internal_ip"] or "").strip() == internal_ip.strip()
+            ]
+        else:
+            previous_ip = previous_ip.strip()
+            internal_ips = {str(row["internal_ip"] or "").strip() for row in rows}
+            if previous_ip and len(internal_ips) > 1:
+                rows = [
+                    row
+                    for row in rows
+                    if str(row["last_ip"] or "").strip() == previous_ip
+                ]
+            if len({str(row["internal_ip"] or "").strip() for row in rows}) > 1:
+                return []
+        if not rows:
+            return []
+
+        try:
+            now = int(time.time())
+            self.conn.executemany(
+                """
+                UPDATE relay_bindings
+                SET router_id = ?, interface = ?, internal_ip = ?, updated_at = ?
+                WHERE id = ? AND enabled = 1
+                """,
+                [
+                    (
+                        str(router_id),
+                        str(interface),
+                        str(internal_ip),
+                        now,
+                        int(row["id"]),
+                    )
+                    for row in rows
+                ],
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return []
+        logging.info(
+            "Migrated relay bindings %s to %s/%s",
+            ",".join(str(row["id"]) for row in rows),
+            router_id,
+            interface,
+        )
+        return self.list_relay_bindings_for_zone(router_id, interface)
 
     def get_relay_binding(self, binding_id: int) -> RelayBinding | None:
         row = self.conn.execute(
@@ -1702,6 +1852,7 @@ class IppanelClient:
             urllib.request.HTTPCookieProcessor(self.cookie_jar)
         )
         self.logged_in = False
+        self.csrf_token = ""
         self._query_all_cache: dict[str, Any] | None = None
         self._query_all_cache_at = 0.0
 
@@ -1724,6 +1875,7 @@ class IppanelClient:
         if is_login_page(response.text) and response.final_url.rstrip("/").endswith("/login"):
             raise IppanelError("Panel login failed. Check IPPANEL_ACCOUNT and IPPANEL_PASSWORD.")
         self.logged_in = True
+        self.csrf_token = ""
 
     def query_all(self, force: bool = False) -> dict[str, Any]:
         now = time.monotonic()
@@ -1736,13 +1888,16 @@ class IppanelClient:
             return dict(self._query_all_cache)
 
         try:
-            payload = self._request_json_authed("/api/query_all", json_data={}, timeout=60)
+            lines_payload = self._request_json_authed(
+                "/api/v2/lines", method="GET", timeout=60
+            )
         except IppanelRateLimited:
             if self._query_all_cache is not None:
                 logging.info("Using cached query_all payload after panel rate limit")
                 return dict(self._query_all_cache)
             raise
 
+        payload = self._normalize_lines_payload(lines_payload)
         self._query_all_cache = dict(payload)
         self._query_all_cache_at = now
         return payload
@@ -1750,26 +1905,232 @@ class IppanelClient:
     def reconnect(self, router_id: str, interface: str) -> dict[str, Any]:
         self._query_all_cache = None
         self._query_all_cache_at = 0.0
-        return self._request_json_authed(
-            "/api/reconnect",
-            json_data={"router_id": str(router_id), "interface": str(interface)},
-            timeout=95,
+        if str(interface) != LEGACY_INTERFACE:
+            raise IppanelError("新版面板线路标识无效，请重新打开机器列表。")
+
+        old_ip = self.get_target_ip(router_id, interface)
+        start_payload = self._request_json_authed(
+            f"/api/v2/lines/{urllib.parse.quote(str(router_id), safe='')}/reconnect/async",
+            method="POST",
+            json_data={},
+            timeout=30,
+            csrf=True,
         )
 
+        if start_payload.get("error"):
+            return dict(start_payload)
+
+        job_id = str(start_payload.get("job_id") or "").strip()
+        if not job_id:
+            return self._normalize_v2_change_result(start_payload, old_ip)
+
+        deadline = time.monotonic() + V2_JOB_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            job_payload = self._request_json_authed(
+                f"/api/v2/lines/reconnect/jobs/{urllib.parse.quote(job_id, safe='')}",
+                method="GET",
+                timeout=30,
+                csrf=True,
+            )
+            status = str(job_payload.get("status") or "").strip().lower()
+            if status in {"queued", "running"}:
+                time.sleep(V2_JOB_POLL_SECONDS)
+                continue
+            if status == "error" or job_payload.get("error"):
+                return {
+                    **job_payload,
+                    "old_ip": old_ip,
+                    "retryable": False,
+                    "error": str(job_payload.get("error") or "换 IP 任务失败"),
+                }
+            return self._normalize_v2_change_result(job_payload, old_ip)
+
+        logging.warning("Panel v2 reconnect job timed out for line %s", router_id)
+        return {
+            "old_ip": old_ip,
+            "ip_pending": True,
+            "error": "换 IP 已提交，但暂时无法确认结果。",
+        }
+
+    def get_target_ip(self, router_id: str, interface: str) -> str:
+        if str(interface) != LEGACY_INTERFACE:
+            raise IppanelError("新版面板线路标识无效，请重新打开机器列表。")
+        return self._query_line_ip(str(router_id))
+
+    def _query_line_ip(self, line_id: str) -> str:
+        payload = self._request_json_authed(
+            f"/api/v2/lines/{urllib.parse.quote(line_id, safe='')}/query",
+            method="POST",
+            json_data={},
+            timeout=60,
+            csrf=True,
+        )
+        if payload.get("error"):
+            raise IppanelError(str(payload["error"]))
+        return validate_public_ipv4(str(payload.get("public_ip") or payload.get("ip") or ""))
+
+    def _query_catalog_product(self, product_ref: str) -> dict[str, Any]:
+        payload = self._request_json_authed(
+            f"/api/v2/catalog/{urllib.parse.quote(product_ref, safe='')}/query",
+            method="POST",
+            json_data={},
+            timeout=60,
+            csrf=True,
+        )
+        if payload.get("error"):
+            raise IppanelError(str(payload["error"]))
+        return payload
+
+    def _normalize_lines_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("error"):
+            return {
+                "backend_mode": "legacy",
+                "error": str(payload["error"]),
+                "results": {},
+                "errors": {"panel": str(payload["error"])},
+                "zone_items": [],
+            }
+        raw_lines = payload.get("lines") or []
+        if not isinstance(raw_lines, list):
+            raise IppanelError("新版面板返回的线路列表格式无效。")
+
+        results: dict[str, dict[str, str]] = {}
+        errors: dict[str, str] = {}
+        zone_items: list[dict[str, Any]] = []
+        for raw_line in raw_lines:
+            if not isinstance(raw_line, dict):
+                continue
+            line = dict(raw_line)
+            line_id = str(line.get("line_id") or "").strip()
+            product_ref = str(line.get("product_ref") or "").strip()
+            if not line_id and product_ref:
+                try:
+                    catalog_data = self._query_catalog_product(product_ref)
+                except IppanelError as exc:
+                    line["status"] = "error"
+                    line["status_message"] = str(exc)
+                    catalog_data = {}
+                if catalog_data:
+                    line.update(catalog_data)
+                    line_id = str(catalog_data.get("line_id") or "").strip()
+            if not line_id:
+                continue
+
+            status = str(line.get("status") or "").strip().lower()
+            status_message = str(
+                line.get("status_message") or line.get("status_msg") or ""
+            ).strip()
+            can_reconnect = line.get("can_reconnect")
+            if status in {"", "catalog"}:
+                status = "ok" if can_reconnect else "query_only"
+            elif status == "ok" and can_reconnect is False:
+                status = "query_only"
+            elif can_reconnect is True and status not in {"error", "blacklisted", "query_only"}:
+                status = "ok"
+
+            current_ip = str(line.get("public_ip") or line.get("ip") or "").strip()
+            if current_ip:
+                try:
+                    current_ip = validate_public_ipv4(current_ip)
+                except IppanelTransientError:
+                    current_ip = ""
+            if not current_ip and status != "error":
+                try:
+                    current_ip = self._query_line_ip(line_id)
+                except IppanelError as exc:
+                    status = "error"
+                    status_message = status_message or str(exc)
+
+            if status == "error" and status_message:
+                errors[line_id] = status_message
+            results[line_id] = {LEGACY_INTERFACE: current_ip}
+            zone_items.append(
+                {
+                    "router_id": line_id,
+                    "interface": LEGACY_INTERFACE,
+                    "label": str(
+                        line.get("label") or line.get("product_name") or ""
+                    ).strip(),
+                    "dedicated_ip": str(line.get("dedicated_ip") or "").strip(),
+                    "status": status,
+                    "status_msg": status_message,
+                }
+            )
+
+        normalized: dict[str, Any] = {
+            "backend_mode": "legacy",
+            "results": results,
+            "errors": errors,
+            "zone_items": zone_items,
+        }
+        for key in (
+            "daily_used",
+            "daily_limit",
+            "daily_unlimited",
+            "total_changes",
+        ):
+            if key in payload:
+                normalized[key] = payload[key]
+        return normalized
+
+    def _normalize_v2_change_result(
+        self, payload: dict[str, Any], old_ip: str
+    ) -> dict[str, Any]:
+        result = dict(payload)
+        result["old_ip"] = str(result.get("old_ip") or old_ip)
+        candidate = str(
+            result.get("new_ip") or result.get("public_ip") or result.get("ip") or ""
+        ).strip()
+        if candidate:
+            try:
+                candidate = validate_public_ipv4(candidate)
+            except IppanelTransientError:
+                candidate = ""
+        if candidate:
+            if candidate == old_ip:
+                result["ip_unchanged"] = True
+            else:
+                result["new_ip"] = candidate
+        elif not result.get("ip_unchanged"):
+            result["ip_pending"] = True
+        return result
+
     def _request_json_authed(
-        self, path: str, json_data: dict[str, Any], timeout: int
+        self,
+        path: str,
+        method: str = "GET",
+        json_data: dict[str, Any] | None = None,
+        timeout: int = 30,
+        csrf: bool = False,
     ) -> dict[str, Any]:
         auth_retried = False
         transient_attempt = 0
         while True:
             try:
                 self.login()
-                return self._request_json(path, json_data=json_data, timeout=timeout)
+                headers: dict[str, str] = {}
+                if csrf:
+                    if not self.csrf_token:
+                        session = self._request_json(
+                            "/api/v2/session", method="GET", timeout=30
+                        )
+                        self.csrf_token = str(session.get("csrf_token") or "").strip()
+                        if not self.csrf_token:
+                            raise IppanelError("新版面板没有返回 CSRF Token。")
+                    headers["X-CSRF-Token"] = self.csrf_token
+                return self._request_json(
+                    path,
+                    method=method,
+                    json_data=json_data,
+                    timeout=timeout,
+                    extra_headers=headers,
+                )
             except IppanelAuthExpired:
                 if auth_retried:
                     raise
                 logging.info("Panel session expired; logging in again")
                 self.logged_in = False
+                self.csrf_token = ""
                 auth_retried = True
                 continue
             except IppanelTransientError as exc:
@@ -1787,9 +2148,20 @@ class IppanelClient:
                 time.sleep(delay)
 
     def _request_json(
-        self, path: str, json_data: dict[str, Any], timeout: int
+        self,
+        path: str,
+        method: str = "GET",
+        json_data: dict[str, Any] | None = None,
+        timeout: int = 30,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        response = self._request_raw(path, method="POST", json_data=json_data, timeout=timeout)
+        response = self._request_raw(
+            path,
+            method=method,
+            json_data=json_data,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
         if response.status == 401 or is_login_page(response.text):
             raise IppanelAuthExpired("Panel session expired.")
         if response.status == 429:
@@ -1815,6 +2187,7 @@ class IppanelClient:
         method: str,
         json_data: dict[str, Any] | None = None,
         form_data: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
         timeout: int = 30,
     ) -> HttpResponse:
         url = urllib.parse.urljoin(self.base_url + "/", path.lstrip("/"))
@@ -1829,6 +2202,8 @@ class IppanelClient:
         elif form_data is not None:
             body = urllib.parse.urlencode(form_data).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if extra_headers:
+            headers.update(extra_headers)
 
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
@@ -2511,6 +2886,16 @@ def format_change_result(
     payload_after: dict[str, Any] | None,
     zone_after: ZoneItem | None,
 ) -> str:
+    if reconnect_data.get("ip_pending"):
+        name = zone_before.display_name if zone_before else "目标机器"
+        old_ip = reconnect_data.get("old_ip") or (zone_before.current_ip if zone_before else "")
+        lines = [tg_bold(f"{name} 换 IP 已提交，但暂时无法确认")]
+        if old_ip:
+            lines.append(f"换 IP 前：{old_ip}")
+        if reconnect_data.get("error"):
+            lines.append(f"最近状态：{reconnect_data.get('error')}")
+        lines.append("Bot 不会重复提交，请稍后使用 /ip 查询。")
+        return "\n".join(lines)
     if reconnect_data.get("error"):
         name = zone_before.display_name if zone_before else "目标机器"
         return f"{tg_bold(f'{name} 更换失败')}：{reconnect_data.get('error')}"
@@ -2555,6 +2940,10 @@ def format_change_result(
 
 
 def should_retry_change_result(reconnect_data: dict[str, Any]) -> bool:
+    if reconnect_data.get("ip_pending"):
+        return False
+    if reconnect_data.get("retryable") is False:
+        return False
     if reconnect_data.get("error"):
         return True
     if reconnect_data.get("ip_unchanged"):
@@ -2563,6 +2952,8 @@ def should_retry_change_result(reconnect_data: dict[str, Any]) -> bool:
 
 
 def change_retry_reason(reconnect_data: dict[str, Any]) -> str:
+    if reconnect_data.get("ip_pending"):
+        return "换 IP 已提交，但暂时无法确认"
     if reconnect_data.get("error"):
         return str(reconnect_data.get("error"))
     if reconnect_data.get("ip_unchanged"):
@@ -3031,7 +3422,13 @@ class BotApp:
             for offset, zone in enumerate(page_zones, start=1):
                 index = start + offset
                 lines.extend(format_zone_line(index, zone))
-                binding = self.store.get_ddns_binding(chat_id, zone.router_id, zone.interface)
+                binding = self.store.get_ddns_binding_for_zone(
+                    chat_id,
+                    zone.router_id,
+                    zone.interface,
+                    target_name=zone.display_name,
+                    previous_ip=zone.current_ip,
+                )
                 if binding:
                     lines.append(f"   DDNS：{binding.hostname}")
                 lines.append("")
@@ -3221,8 +3618,12 @@ class BotApp:
             for offset, zone in enumerate(page_zones, start=1):
                 index = start + offset
                 lines.append(tg_bold(f"{index}. {zone.display_name}"))
-                all_bindings = self.store.list_relay_bindings_for_zone(
-                    zone.router_id, zone.interface
+                all_bindings = self.store.migrate_relay_bindings_for_zone(
+                    zone.router_id,
+                    zone.interface,
+                    zone.display_name,
+                    zone.dedicated_ip,
+                    previous_ip=zone.current_ip,
                 )
                 matched = [
                     binding
@@ -3301,7 +3702,13 @@ class BotApp:
             )
             return_page = zone_index // PAGE_SIZE
 
-            bindings = self.store.list_relay_bindings_for_zone(router_id, interface)
+            bindings = self.store.migrate_relay_bindings_for_zone(
+                router_id,
+                interface,
+                zone.display_name,
+                zone.dedicated_ip,
+                previous_ip=zone.current_ip,
+            )
             matched = [
                 binding for binding in bindings if relay_binding_matches_zone(binding, zone)
             ]
@@ -3855,7 +4262,21 @@ class BotApp:
     def sync_ddns_after_change(self, chat_id: int, router_id: str, interface: str) -> str:
         if not (self.config.ddns_enabled and self.config.ddns_sync_after_change):
             return ""
-        binding = self.store.get_ddns_binding(chat_id, router_id, interface)
+        context = self.last_change_context.get((str(router_id), str(interface)))
+        reconnect_data = context.reconnect_data if context else {}
+        if reconnect_data.get("error") or reconnect_data.get("ip_pending"):
+            return ""
+        target_name = context.zone_after.display_name if context and context.zone_after else ""
+        if not target_name and context and context.zone_before:
+            target_name = context.zone_before.display_name
+        previous_ip = context.zone_before.current_ip if context and context.zone_before else ""
+        binding = self.store.get_ddns_binding_for_zone(
+            chat_id,
+            router_id,
+            interface,
+            target_name=target_name,
+            previous_ip=previous_ip,
+        )
         if not binding:
             return ""
         try:
@@ -3865,11 +4286,23 @@ class BotApp:
             return f"DDNS 同步失败：{exc}"
 
     def sync_ddns_after_confirmed(
-        self, chat_id: int, router_id: str, interface: str, new_ip: str
+        self,
+        chat_id: int,
+        router_id: str,
+        interface: str,
+        new_ip: str,
+        target_name: str = "",
+        previous_ip: str = "",
     ) -> str:
         if not (self.config.ddns_enabled and self.config.ddns_sync_after_change):
             return ""
-        binding = self.store.get_ddns_binding(chat_id, router_id, interface)
+        binding = self.store.get_ddns_binding_for_zone(
+            chat_id,
+            router_id,
+            interface,
+            target_name=target_name,
+            previous_ip=previous_ip,
+        )
         if not binding:
             return ""
         try:
@@ -3884,11 +4317,11 @@ class BotApp:
         key = (str(router_id), str(interface))
         context = self.last_change_context.get(key)
         reconnect_data = context.reconnect_data if context else {}
-        if reconnect_data.get("error") or reconnect_data.get("ip_unchanged"):
-            return ""
-
-        bindings = self.store.list_relay_bindings_for_zone(router_id, interface)
-        if not bindings:
+        if (
+            reconnect_data.get("error")
+            or reconnect_data.get("ip_pending")
+            or reconnect_data.get("ip_unchanged")
+        ):
             return ""
 
         zone = context.zone_after if context else None
@@ -3903,6 +4336,20 @@ class BotApp:
             return "中转同步失败：面板里没有找到已绑定的 VPS。"
         if not zone.dedicated_ip and zone.interface != API_INTERFACE:
             return "中转同步失败：面板没有返回内网 IP，无法校验绑定。"
+
+        bindings = self.store.migrate_relay_bindings_for_zone(
+            router_id,
+            interface,
+            zone.display_name,
+            zone.dedicated_ip,
+            previous_ip=str(
+                reconnect_data.get("old_ip")
+                or (context.zone_before.current_ip if context and context.zone_before else "")
+                or zone.current_ip
+            ).strip(),
+        )
+        if not bindings:
+            return ""
 
         matched = [
             binding for binding in bindings if relay_binding_matches_zone(binding, zone)
@@ -4318,6 +4765,8 @@ class BotApp:
             operation.router_id,
             operation.interface,
             new_ip,
+            target_name=operation.target_name,
+            previous_ip=operation.old_ip,
         )
         if ddns_result:
             result = f"{result}\n\n{ddns_result}"
