@@ -55,6 +55,7 @@ ${APP_NAME} 管理脚本
 用法：
   sudo boil install
   sudo boil config
+  sudo boil mode
   sudo boil update
   sudo boil relay
   sudo boil start|stop|restart|status|logs
@@ -690,6 +691,68 @@ run_config() {
   fi
 }
 
+write_panel_mode() {
+  local mode="$1" tmp
+  case "$mode" in
+    legacy|api) ;;
+    *) die "IPPANEL_MODE must be legacy or api." ;;
+  esac
+  [ -f "$ENV_FILE" ] || die "配置文件不存在：${ENV_FILE}"
+  tmp="$(mktemp)"
+  if ! awk -v mode="$mode" '
+    BEGIN { found = 0 }
+    /^IPPANEL_MODE=/ {
+      print "IPPANEL_MODE=" mode
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print "IPPANEL_MODE=" mode
+    }
+  ' "$ENV_FILE" >"$tmp"; then
+    rm -f "$tmp"
+    die "切换面板模式失败。"
+  fi
+  install -m 600 -o root -g root "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+run_mode_switch() {
+  require_root "$@"
+  require_systemd
+  require_installed
+
+  local current_mode target_mode account password api_targets_file
+  current_mode="$(env_value IPPANEL_MODE || true)"
+  [ "$current_mode" = "api" ] || current_mode="legacy"
+  account="$(env_value IPPANEL_ACCOUNT || true)"
+  password="$(env_value IPPANEL_PASSWORD || true)"
+  api_targets_file="$(env_value IPPANEL_API_TARGETS_FILE || true)"
+  [ -n "$api_targets_file" ] || api_targets_file="$API_TARGETS_FILE"
+
+  if [ "$current_mode" = "api" ]; then
+    target_mode="legacy"
+    if [ -z "$account" ] || [ -z "$password" ]; then
+      die "未检测到登录模式账号和密码，无法切换。"
+    fi
+  else
+    target_mode="api"
+    if [ ! -s "$api_targets_file" ]; then
+      die "未检测到 API targets 配置，无法切换。"
+    fi
+  fi
+
+  write_panel_mode "$target_mode"
+  ok "已切换面板模式：${current_mode} -> ${target_mode}"
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    systemctl restart "$SERVICE_NAME"
+    ok "服务已重启，切换立即生效。"
+  else
+    info "服务当前未运行；下次启动时将使用新模式。"
+  fi
+}
+
 run_update() {
   require_root "$@"
   require_systemd
@@ -860,7 +923,8 @@ run_menu() {
     printf "  7) 查看状态\n"
     printf "  8) 查看日志\n"
     printf "  9) 配置中转同步\n"
-    printf " 10) 卸载\n"
+    printf " 10) 切换面板模式\n"
+    printf " 11) 卸载\n"
     printf "  0) 退出\n"
     read -r -p "请选择: " choice
     case "$choice" in
@@ -873,7 +937,8 @@ run_menu() {
       7) menu_require_installed && run_status ;;
       8) menu_require_installed && run_logs ;;
       9) menu_require_installed && run_relay_config ;;
-      10) run_uninstall ;;
+      10) menu_require_installed && run_mode_switch ;;
+      11) run_uninstall ;;
       0) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -886,6 +951,7 @@ main() {
   case "$cmd" in
     install) run_install "$@" ;;
     config|configure|modify) run_config "$@" ;;
+    mode|switch-mode) run_mode_switch "$@" ;;
     update|upgrade) run_update "$@" ;;
     relay) run_relay_config "$@" ;;
     start|stop|restart) run_service_action "$cmd" "$@" ;;

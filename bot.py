@@ -1401,8 +1401,10 @@ class BotStore:
         secret: str,
         receiver_target_name: str,
         match_mode: str = "remark",
+        last_ip: str = "",
     ) -> int:
         now = int(time.time())
+        last_ip = str(last_ip or "").strip()
         existing = self.conn.execute(
             """
             SELECT id FROM relay_bindings
@@ -1423,6 +1425,7 @@ class BotStore:
                 """
                 UPDATE relay_bindings
                 SET target_name = ?, reporter = ?, secret = ?, match_mode = ?,
+                    last_ip = COALESCE(NULLIF(?, ''), last_ip),
                     enabled = 1, last_error = '', updated_at = ?
                 WHERE id = ?
                 """,
@@ -1431,6 +1434,7 @@ class BotStore:
                     reporter,
                     secret,
                     normalize_relay_match_mode(match_mode),
+                    last_ip,
                     now,
                     binding_id,
                 ),
@@ -1442,8 +1446,8 @@ class BotStore:
             """
             INSERT INTO relay_bindings
               (router_id, interface, internal_ip, target_name, receiver_url, reporter, secret,
-               receiver_target_name, match_mode, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+               receiver_target_name, match_mode, last_ip, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 str(router_id),
@@ -1455,6 +1459,7 @@ class BotStore:
                 secret,
                 receiver_target_name,
                 normalize_relay_match_mode(match_mode),
+                last_ip,
                 now,
                 now,
             ),
@@ -1500,38 +1505,60 @@ class BotStore:
         previous_ip: str = "",
     ) -> list[RelayBinding]:
         existing = self.list_relay_bindings_for_zone(router_id, interface)
-        if existing or not target_name.strip():
+        target_name = target_name.strip()
+        internal_ip = internal_ip.strip()
+        previous_ip = previous_ip.strip()
+        if existing or not target_name:
             return existing
 
         rows = self.conn.execute(
             """
-            SELECT id, internal_ip, last_ip FROM relay_bindings
-            WHERE target_name = ? AND enabled = 1
+            SELECT id, router_id, interface, target_name, internal_ip, last_ip
+            FROM relay_bindings
+            WHERE enabled = 1
             ORDER BY id
-            """,
-            (target_name.strip(),),
+            """
         ).fetchall()
-        if not rows:
+
+        named_rows = [
+            row for row in rows if str(row["target_name"] or "").strip() == target_name
+        ]
+        candidates = named_rows
+        if previous_ip:
+            ip_rows = [
+                row for row in rows if str(row["last_ip"] or "").strip() == previous_ip
+            ]
+            ip_ids = {int(row["id"]) for row in ip_rows}
+            named_ip_rows = [row for row in named_rows if int(row["id"]) in ip_ids]
+            if named_ip_rows:
+                candidates = named_ip_rows
+            elif not candidates and ip_rows:
+                if len({str(row["target_name"] or "").strip() for row in ip_rows}) == 1:
+                    candidates = ip_rows
+        if not candidates:
             return []
 
-        if internal_ip.strip():
-            rows = [
+        if internal_ip:
+            exact_rows = [
                 row
-                for row in rows
-                if str(row["internal_ip"] or "").strip() == internal_ip.strip()
+                for row in candidates
+                if str(row["internal_ip"] or "").strip() == internal_ip
             ]
-        else:
-            previous_ip = previous_ip.strip()
-            internal_ips = {str(row["internal_ip"] or "").strip() for row in rows}
-            if previous_ip and len(internal_ips) > 1:
-                rows = [
-                    row
-                    for row in rows
-                    if str(row["last_ip"] or "").strip() == previous_ip
+            if exact_rows:
+                candidates = exact_rows
+            else:
+                blank_rows = [
+                    row for row in candidates if not str(row["internal_ip"] or "").strip()
                 ]
-            if len({str(row["internal_ip"] or "").strip() for row in rows}) > 1:
+                if not blank_rows or any(
+                    str(row["internal_ip"] or "").strip() for row in candidates
+                ):
+                    return []
+                candidates = blank_rows
+        else:
+            if len({str(row["internal_ip"] or "").strip() for row in candidates}) > 1:
                 return []
-        if not rows:
+        if not candidates:
             return []
 
         try:
@@ -1539,18 +1566,19 @@ class BotStore:
             self.conn.executemany(
                 """
                 UPDATE relay_bindings
-                SET router_id = ?, interface = ?, internal_ip = ?, updated_at = ?
+                SET router_id = ?, interface = ?, internal_ip = ?, target_name = ?, updated_at = ?
                 WHERE id = ? AND enabled = 1
                 """,
                 [
                     (
                         str(router_id),
                         str(interface),
-                        str(internal_ip),
+                        internal_ip,
+                        target_name,
                         now,
                         int(row["id"]),
                     )
-                    for row in rows
+                    for row in candidates
                 ],
             )
             self.conn.commit()
@@ -1559,7 +1587,7 @@ class BotStore:
             return []
         logging.info(
             "Migrated relay bindings %s to %s/%s",
-            ",".join(str(row["id"]) for row in rows),
+            ",".join(str(row["id"]) for row in candidates),
             router_id,
             interface,
         )
@@ -5120,6 +5148,7 @@ def cli_configure_relay(config: Config) -> int:
             secret=secret,
             receiver_target_name=receiver_target_name,
             match_mode=match_mode,
+            last_ip=zone.current_ip,
         )
     finally:
         store.close()
